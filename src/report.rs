@@ -95,6 +95,9 @@ pub struct RuleReport {
     /// Failing rows aggregated by value, most frequent first (up to the
     /// report limit).
     pub fail_results: Vec<GroupedExample>,
+    /// Rows skipped by the explicit `validation_skipped` predicate, aggregated
+    /// by value like the matching and failing results.
+    pub validation_skipped_results: Vec<GroupedExample>,
     /// Column indices referenced by the rule (left/right/derive/predicates).
     /// GUI-only: used to show just the attributes a rule looks at. Not part of
     /// the serialized report contract.
@@ -175,6 +178,16 @@ impl Report {
             if !rule.fail_results.is_empty() {
                 let _ = writeln!(out, "    failed results ({}):", rule.fail_results.len());
                 for group in &rule.fail_results {
+                    let _ = writeln!(out, "      {}", format_group(group));
+                }
+            }
+            if !rule.validation_skipped_results.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "    validation-skipped results ({}):",
+                    rule.validation_skipped_results.len()
+                );
+                for group in &rule.validation_skipped_results {
                     let _ = writeln!(out, "      {}", format_group(group));
                 }
             }
@@ -280,7 +293,7 @@ impl Report {
             out,
             "<nav class=\"outline\" id=\"outline\"><h2>Outline</h2>\
              <div class=\"table-scroll\"><table><thead><tr>\
-             <th>target</th><th>source</th><th>rule</th><th>status</th>\
+             <th>target</th><th>source</th><th>rule</th><th>mapping</th><th>status</th>\
              <th>checked</th><th>passed</th><th>failed</th><th>skipped</th>\
              <th>validation skipped</th>\
              </tr></thead><tbody>"
@@ -288,10 +301,19 @@ impl Report {
         for &index in &order {
             let rule = &self.rules[index];
             let status = if rule.passed() { "passed" } else { "failed" };
+            let mapping = match &rule.mapping {
+                Some(mapping) => format!(
+                    "<span class=\"map {source}\">{label}</span>",
+                    source = html_escape(&mapping.source),
+                    label = html_escape(&mapping.source),
+                ),
+                None => "<span class=\"map none\">&mdash;</span>".to_string(),
+            };
             let _ = writeln!(
                 out,
                 "<tr><td><code>{target}</code></td><td><code>{source}</code></td>\
                  <td><a href=\"#rule-{anchor}\">{name}</a></td>\
+                 <td>{mapping}</td>\
                  <td><span class=\"badge {status}\">{status}</span></td>\
                  <td>{checked}</td><td class=\"pass\">{passed}</td>\
                  <td class=\"fail\">{failed}</td><td>{skipped}</td>\
@@ -300,6 +322,7 @@ impl Report {
                 source = html_escape(&rule.left),
                 anchor = index + 1,
                 name = html_escape(&rule.name),
+                mapping = mapping,
                 checked = rule.rows_checked,
                 passed = rule.rows_passed,
                 failed = rule.rows_failed,
@@ -363,6 +386,14 @@ impl Report {
                     rule.fail_results.len()
                 );
                 out.push_str(&html_grouped_table(&rule.fail_results));
+            }
+            if !rule.validation_skipped_results.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "<h3 class=\"skip\">Validation-skipped results ({})</h3>",
+                    rule.validation_skipped_results.len()
+                );
+                out.push_str(&html_grouped_table(&rule.validation_skipped_results));
             }
 
             if let Some(mapping) = &rule.mapping {
@@ -463,6 +494,11 @@ th { color: #6b7280; font-weight: 600; }
 tbody tr:nth-child(odd) { background: #fafbfc; }
 .mapping { margin-top: 14px; border-top: 1px dashed #dfe3e8; padding-top: 10px; }
 .tag { font-size: 11px; background: #eef2ff; color: #4338ca; padding: 1px 7px; border-radius: 999px; text-transform: uppercase; }
+.map { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; letter-spacing: .03em; text-transform: uppercase; }
+.map.auto { background: #eef2ff; color: #4338ca; }
+.map.file { background: #fef3c7; color: #92400e; }
+.map.none { color: #9ca3af; }
+h3.skip { color: #a16207; }
 .ambiguity { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 8px 12px; margin: 8px 0; }
 .ambiguity p { margin: 4px 0; }
 .targets { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -476,6 +512,8 @@ summary { cursor: pointer; color: #4338ca; }
   th, td { border-color: #2a3040; }
   tbody tr:nth-child(odd) { background: #1b202b; }
   .chip { background: #1b202b; border-color: #2a3040; }
+  .map.auto { background: #1e1b4b; color: #c7d2fe; }
+  .map.file { background: #3a2e12; color: #fde68a; }
   .ambiguity { background: #2a2410; border-color: #6b5b1e; }
   .rule .columns, .stats, .columns { color: #9ca3af; }
 }

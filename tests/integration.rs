@@ -211,6 +211,10 @@ fn html_report_is_self_contained() {
     assert!(stdout.contains("href=\"#rule-4\""), "outline link missing");
     assert!(stdout.contains("href=\"#outline\""), "back link missing");
 
+    // The outline marks how each rule's mapping was obtained.
+    assert!(stdout.contains("class=\"map auto\""), "missing auto mapping badge");
+    assert!(stdout.contains("class=\"map file\""), "missing file mapping badge");
+
     // The outline is sorted by target column name.
     let outline = {
         let start = stdout.find("id=\"outline\"").unwrap();
@@ -318,6 +322,16 @@ fn fallback_skip_and_mapping_filter() {
     assert_eq!(rules[1]["rows_skipped"], 0);
     assert_eq!(rules[1]["rows_validation_skipped"], 1);
     assert_eq!(rules[1]["rows_failed"], 4);
+    // The skipped row is grouped alongside the matching/failing examples.
+    let skipped = rules[1]["validation_skipped_results"].as_array().unwrap();
+    assert_eq!(skipped.len(), 1);
+    assert_eq!(skipped[0]["count"], 1);
+    assert_eq!(skipped[0]["ids"].as_array().unwrap().len(), 1);
+    // A rule with no validation skips reports an empty list, not a missing key.
+    assert!(rules[0]["validation_skipped_results"]
+        .as_array()
+        .unwrap()
+        .is_empty());
 
     // `validation_skipped = any_in([...], [...])` skips row 7 (code SKIP).
     assert_eq!(rules[2]["rows_skipped"], 0);

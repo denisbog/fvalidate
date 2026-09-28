@@ -342,16 +342,19 @@ machine-readable JSON (`--format json`) or as a **self-contained HTML page**
 (`--format html`, no external assets, light/dark aware, all values
 HTML-escaped). The HTML report opens with an **outline** — one row per rule,
 sorted by target column — showing the validation summary (status, checked,
-passed, failed, skipped); click a rule name to jump to its section, and use the
-“↑ outline” link there to return. For every rule the report contains:
+passed, failed, skipped) and a **mapping badge** that highlights how the rule
+resolves its values: `auto` (indigo, the relation is extracted from the data) or
+`file` (amber, loaded from reference CSVs); click a rule name to jump to its
+section, and use the “↑ outline” link there to return. For every rule the report
+contains:
 
 * the number of rows checked, passed, **skipped**, **validation skipped** and failed;
 * transform errors and unmapped values;
-* matching and failed rows **aggregated by condition** — the
-  `(left, right, expected)` values — with the row count and up to `N` example
-  ids per condition, most frequent condition first (`-n` controls `N`, i.e. how
-  many conditions and how many ids per condition are shown; ties are broken by
-  value, so the report is deterministic);
+* matching, failed and **validation-skipped** rows **aggregated by condition** —
+  the `(left, right, expected)` values — with the row count and up to `N`
+  example ids per condition, most frequent condition first (`-n` controls `N`,
+  i.e. how many conditions and how many ids per condition are shown; ties are
+  broken by value, so the report is deterministic);
 * the **complete** extracted/loaded mapping;
 * for every ambiguous input (up to `N`), the distinct target values with counts,
   and example rows.
@@ -377,6 +380,8 @@ Rows checked    : 8
       ...
     failed results (1):
       count=1 left="france" right="US" expected="FR" ids=["5"]
+    validation-skipped results (1):
+      count=1 left="IT" right="IT" ids=["4"]
     mapping (auto): 4 distinct inputs, 1 ambiguous
       ambiguous input "france" -> "FR" (4), "US" (1)
         example: row=1 id="1" left="france" right="FR" expected="FR"

@@ -250,6 +250,9 @@ struct RuleAccum {
     unmapped: u64,
     pass_results: ResultGroups,
     fail_results: ResultGroups,
+    /// Rows skipped by the explicit `validation_skipped` predicate, grouped the
+    /// same way as the matching and failing results.
+    skip_results: ResultGroups,
     /// Every row of the rule, collected only when `collect_hits` selects it.
     hits: Vec<RowHit>,
     /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
@@ -269,6 +272,7 @@ impl RuleAccum {
             unmapped: 0,
             pass_results: ResultGroups::new(limit),
             fail_results: ResultGroups::new(limit),
+            skip_results: ResultGroups::new(limit),
             hits: Vec::new(),
             ambiguous_samples: Sampler::new(limit),
         }
@@ -284,6 +288,7 @@ impl RuleAccum {
         self.unmapped += other.unmapped;
         self.pass_results.merge(other.pass_results);
         self.fail_results.merge(other.fail_results);
+        self.skip_results.merge(other.skip_results);
         self.hits.extend(other.hits);
         self.ambiguous_samples.merge(other.ambiguous_samples);
     }
@@ -681,6 +686,8 @@ fn validate_segment(
         for (rule_index, rule) in rules.iter().enumerate() {
             let accum = &mut accums[rule_index];
 
+            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
+
             // An explicit `validation_skipped` predicate marks the row as
             // skipped. `mapping_filter` no longer skips validation; it only
             // selects which rows define the mapping.
@@ -688,11 +695,39 @@ fn validate_segment(
                 if predicate_holds(predicate, &cells, slots, rule.trim) {
                     accum.checked += 1;
                     accum.validation_skipped += 1;
+                    if !accum.skip_results.is_disabled() {
+                        // Compose the values anyway so the skipped rows are
+                        // reported next to the matching and failing ones.
+                        let _ = compose_side(
+                            &rule.left,
+                            &cells,
+                            slots,
+                            &derived,
+                            &rule.transform_left,
+                            &rule.join_separator,
+                            rule.trim,
+                            &mut component_buf,
+                            &mut component_buf2,
+                            &mut left_buf,
+                        );
+                        let _ = compose_side(
+                            &rule.right,
+                            &cells,
+                            slots,
+                            &derived,
+                            &rule.transform_right,
+                            &rule.join_separator,
+                            rule.trim,
+                            &mut component_buf,
+                            &mut component_buf2,
+                            &mut right_buf,
+                        );
+                        let id = row_id(slots, &cells, row_number, local_row);
+                        accum.skip_results.observe(&left_buf, &right_buf, None, &id);
+                    }
                     continue;
                 }
             }
-
-            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
 
             let left_ok = compose_side(
                 &rule.left,
@@ -732,17 +767,7 @@ fn validate_segment(
 
             // Regex rules only need the left value: the rule-level pattern
             // decides the outcome, mirroring xan's `match(value, regex(...))`.
-            let id = match slots.id_slot {
-                Some(slot) => {
-                    let value = cells[slot].trim();
-                    if value.is_empty() {
-                        format!("row:{}", row_number.unwrap_or(local_row))
-                    } else {
-                        value.to_string()
-                    }
-                }
-                None => format!("row:{}", row_number.unwrap_or(local_row)),
-            };
+            let id = row_id(slots, &cells, row_number, local_row);
 
             let mapping = mappings[rule_index].as_deref();
             let expected: &[String];
@@ -865,6 +890,23 @@ fn validate_segment(
     }
 
     Ok(accums)
+}
+
+/// The id used to identify a row in the report: the trimmed id column, or a
+/// `row:N` pseudo-id when there is no id column (or the value is empty).
+#[inline]
+fn row_id(slots: &Slots, cells: &[String], row_number: Option<u64>, local_row: u64) -> String {
+    match slots.id_slot {
+        Some(slot) => {
+            let value = cells[slot].trim();
+            if value.is_empty() {
+                format!("row:{}", row_number.unwrap_or(local_row))
+            } else {
+                value.to_string()
+            }
+        }
+        None => format!("row:{}", row_number.unwrap_or(local_row)),
+    }
 }
 
 /// Return a cleared `String` at `index`, growing the buffer if needed. Used to
@@ -1122,6 +1164,7 @@ fn build_report(
             unmapped_values: accum.unmapped,
             pass_results: accum.pass_results.top(),
             fail_results: accum.fail_results.top(),
+            validation_skipped_results: accum.skip_results.top(),
             rule_columns: rule.used_columns(),
             hits,
             mapping: mapping_report,
