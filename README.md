@@ -24,7 +24,7 @@ comes from a handful of deliberate choices, all of which are applied here:
 | **Zero-copy / reused buffers** — records are read into a single pre-allocated `ByteRecord` that is cleared and refilled, avoiding per-row allocation. | The hot loops keep one `ByteRecord` plus reusable `String`/`Vec` scratch buffers for the whole file. |
 | **Column indexing instead of name lookup** — headers are resolved once, columns accessed by integer index. | Rules are compiled to `left_idx`/`right_idx`, and a `Slots` table maps them to a per-row cell vector. |
 | **Record-aligned parallel segments** — `Seeker` finds safe byte offsets between records, then rayon workers read each segment independently. | `engine::segments_for` uses `Seeker::segments`; pass 1 (mapping extraction) and pass 2 (validation) run `rayon` over those ranges. |
-| **Streaming, bounded memory** — nothing keeps the whole file in RAM. | Example rows use a bounded min-hash reservoir; only the extracted mapping (distinct inputs) is retained. |
+| **Streaming, bounded memory** — nothing keeps the whole file in RAM. | Ambiguity examples use a bounded min-hash reservoir; matching/failing rows are aggregated by condition and keep a bounded id sample per group. |
 | **Tuned release profile** — LTO, single codegen unit, `opt-level = 3`. | See `[profile.release]` in `Cargo.toml`; build with `RUSTFLAGS='-C target-cpu=native'` for AVX2. |
 
 Cold results on a 300k-row / 17 MB file with 4 rules:
@@ -59,7 +59,7 @@ cat data.csv | fvalidate - -r rules.vl --id-column id
 | `-r, --rules <FILE>` | Rule DSL file (required). |
 | `-d, --delimiter <BYTE>` | Field delimiter; `\t`/`tab` accepted (default `,`). |
 | `--id-column <NAME>` | Column holding a unique value used to identify rows. Without it, a lightweight parallel counting pass still assigns exact global row numbers, so validation stays parallel. |
-| `-n, --examples <N>` | Number of example rows per rule (default `10`; overridable per rule). |
+| `-n, --examples <N>` | Number of most frequent result groups per rule, each with up to `N` example ids (default `10`; overridable per rule). |
 | `-j, --threads <N>` | Worker threads (`0` = all cores). |
 | `--format <text\|json\|html>` | Report format (default `text`). |
 | `--title <TITLE>` | Title used by the HTML report. |
@@ -138,6 +138,7 @@ several lines as long as brackets/quotes balance.
 | --- | --- |
 | `left`, `right` | Columns to compare: a header name, `#index`, a list `[a, b]` forming a composite key, or a fallback `or(a, b, c)` that picks the first non-empty column. |
 | `transform_left`, `transform_right` | Normalization pipeline (see below). With several columns it is applied to **each** component before joining. |
+| `derive` | Xan/moonblade-style expression(s) computing named values from the row, usable in `left` / `right` (see [Derived values](#derived-values-derive)). |
 | `compare` | `eq` (default), `ne`, `subset`, `superset`, `intersect`, or regex `matches` / `not_matches`. Operates on token sets. |
 | `multi` | Split cells into multiple values before comparing (default `false`). |
 | `separator` | Token separator when `multi = true`; a plain string or `regex("...")`. |
@@ -145,11 +146,11 @@ several lines as long as brackets/quotes balance.
 | `pattern` | Rule-level regex used by `compare = matches` / `not_matches`; `right` may then be omitted. |
 | `trim` | Trim each extracted cell (and reference-file cell) before transforming (default `false`). |
 | `allow_empty` (alias `optional`) | When `true`, a row whose source and target are both empty is **skipped** instead of failed (default `false`). |
-| `validation_skipped` (aliases `skip_when`, `skip`) | A predicate; rows where it holds are counted as **skipped** (see [Row predicates](#row-predicates)). |
+| `validation_skipped` (aliases `skip_when`, `skip`) | A predicate; rows where it holds are counted as **validation skipped** (see [Row predicates](#row-predicates)). |
 | `mapping_filter` | A predicate selecting which rows **define a mapping**. For `mapping = auto` it runs over the data rows; for `mapping_files` it runs over the reference rows (columns resolved against each file's header). It never skips validation. |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
-| `mapping_left`, `mapping_right` | Column(s) inside the reference files; lists are allowed. |
+| `mapping_left`, `mapping_right` | Column(s) inside the reference files. `mapping_left` lists form a composite key; several `mapping_right` columns form a priority list (first non-empty, scanning right to left). |
 | `mapping_multi`, `mapping_separator` | Multi-value handling inside reference files. |
 | `report_limit` | Overrides `-n` for this rule. |
 
@@ -185,6 +186,58 @@ fvalidate examples/orders.csv -r examples/rules_composite.vl --id-column order_i
 It reports `product + region` as the key, flags the rows whose `warehouse`
 does not match the pair, and — in the `auto` variant — reports `widget|eu` and
 `gizmo|apac` as ambiguous composite keys.
+
+### Derived values (`derive`)
+
+Sometimes the value to compare does not exist as a column yet. `derive`
+computes named extra values from the row using a compact xan/moonblade-style
+expression language; the names then behave like columns in `left` / `right`
+(and shadow input columns of the same name).
+
+```text
+# r_version_label looks like "2.0, CURRENT, APPROVED".
+rule "attachment version is the X.Y token" {
+  derive = 'r_version_label.match(/\d+\.\d+/) or "" as expected'
+  left   = expected
+  right  = attachment_version_for_submission__v
+}
+
+rule "status from the lifecycle state" {
+  derive = 'if(r_current_state eq "2" and contains(upper(r_version_label), "EFFECTIVE"), "Effective", ["Draft","In Review","Approved","Superseded","Obsolete"][int(r_current_state)]) as expected'
+  left   = expected
+  right  = status__v
+}
+```
+
+The language supports literals (including regexes `/.../`), column identifiers,
+`or`/`and`/`not`, comparisons (`==`, `eq`, `ne`, `<`, `in`, …), arithmetic,
+`++` concatenation, indexing/slicing, lists, pipelines, and calls such as
+`match`, `split`, `replace`, `trim`, `lower`, `upper`, `contains`,
+`startswith`, `endswith`, `int`, `float`, `string`, `coalesce`, `if`,
+`in_any([a, b], [accepted...])`, and more. Each clause ends with `as <name>`
+or `as (<name>, <name>)`; several clauses are comma-separated and evaluated in
+order. Expressions are parsed once and evaluated per row.
+
+### Cascading reference values
+
+When the expected value can come from one of several reference columns, list
+them in `mapping_right`. The target is the **first non-empty** value scanning
+the list from right to left, so the list reads as a priority chain:
+
+```text
+# Classification, else Veeva Subtype, else Veeva DocType.
+rule "classification__v from classification-mapping.csv" {
+  derive          = 'if(is_template == "T", "T", "") as template_key'
+  left            = [r_object_type, subtype_code, doc_subtype, category, template_key]
+  right           = classification__v
+  transform_right = trim
+  mapping_files   = ["classification-mapping.csv"]
+  mapping_left    = ["Bracco Object Type", "Bracco Subtype Code", "Bracco Subtype", "Bracco Category", "Template"]
+  mapping_right   = ["Veeva DocType", "Veeva Subtype", "Classification"]
+}
+```
+
+A single `mapping_right` column keeps the plain behaviour.
 
 ### Transforms
 
@@ -292,11 +345,13 @@ sorted by target column — showing the validation summary (status, checked,
 passed, failed, skipped); click a rule name to jump to its section, and use the
 “↑ outline” link there to return. For every rule the report contains:
 
-* the number of rows checked, passed, **skipped** and failed;
+* the number of rows checked, passed, **skipped**, **validation skipped** and failed;
 * transform errors and unmapped values;
-* up to `N` **distinct** matching rows and `N` **distinct** failed rows, keyed
-  by the unique id column (`-n` controls `N`; distinctness and a deterministic,
-  unbiased sample are provided by a bounded min-hash reservoir);
+* matching and failed rows **aggregated by condition** — the
+  `(left, right, expected)` values — with the row count and up to `N` example
+  ids per condition, most frequent condition first (`-n` controls `N`, i.e. how
+  many conditions and how many ids per condition are shown; ties are broken by
+  value, so the report is deterministic);
 * the **complete** extracted/loaded mapping;
 * for every ambiguous input (up to `N`), the distinct target values with counts,
   and example rows.
@@ -315,12 +370,13 @@ Rows checked    : 8
 [2] "country name maps to code"  FAILED
     left  : country_name
     right : country_code
-    checked=8 passed=7 failed=1 transform_errors=0 unmapped_values=0
-    matching rows (7):
-      row=4 id="4" left="united states" right="US" expected="US"
+    checked=8 passed=7 failed=1 skipped=0 validation_skipped=0 transform_errors=0 unmapped_values=0
+    matching results (4):
+      count=4 left="france" right="FR" expected="FR" ids=["7", "1", "2", "8"]
+      count=1 left="germany" right="DE" expected="DE" ids=["6"]
       ...
-    failed rows (1):
-      row=5 id="5" left="france" right="US" expected="FR"
+    failed results (1):
+      count=1 left="france" right="US" expected="FR" ids=["5"]
     mapping (auto): 4 distinct inputs, 1 ambiguous
       ambiguous input "france" -> "FR" (4), "US" (1)
         example: row=1 id="1" left="france" right="FR" expected="FR"
@@ -379,7 +435,9 @@ a row's cells. It is evaluated on the raw cell value (trimmed when
 | `true`, `false` | literals |
 
 `validation_skipped` generalizes `allow_empty`: whenever the predicate holds,
-the row is counted as `skipped` regardless of the source/target values.
+the row is counted separately under `validation_skipped` (it is not mixed into
+the `skipped` count, which only holds `allow_empty` skips) regardless of the
+source/target values.
 
 `mapping_filter` instead selects which rows **define the mapping** — it never
 skips validation, so a filtered-out row is still checked against the resulting

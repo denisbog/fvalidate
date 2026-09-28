@@ -94,8 +94,8 @@ fn example_limit_is_respected() {
     ]);
 
     for rule in report["rules"].as_array().unwrap() {
-        assert!(rule["pass_examples"].as_array().unwrap().len() <= 2);
-        assert!(rule["fail_examples"].as_array().unwrap().len() <= 2);
+        assert!(rule["pass_results"].as_array().unwrap().len() <= 2);
+        assert!(rule["fail_results"].as_array().unwrap().len() <= 2);
         if let Some(mapping) = rule.get("mapping") {
             if mapping.get("ambiguities").is_some() {
                 assert!(mapping["ambiguities"].as_array().unwrap().len() <= 2);
@@ -232,7 +232,11 @@ fn html_escapes_hostile_values() {
     let dir = std::env::temp_dir().join(format!("fvalidate-html-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let csv_path = dir.join("evil.csv");
-    std::fs::write(&csv_path, "id,a,b\n1,\"<script>alert(1)</script>\",\"x & y\"\n").unwrap();
+    std::fs::write(
+        &csv_path,
+        "id,a,b\n1,\"<script>alert(1)</script>\",\"x & y\"\n",
+    )
+    .unwrap();
     let rules_path = dir.join("evil.vl");
     std::fs::write(&rules_path, "rule \"escape\" {\n left = a\n right = b\n}\n").unwrap();
 
@@ -311,11 +315,13 @@ fn fallback_skip_and_mapping_filter() {
     assert_eq!(rules[0]["rows_skipped"], 0);
 
     // `validation_skipped = in(status, [...])` skips row 4 (archived).
-    assert_eq!(rules[1]["rows_skipped"], 1);
+    assert_eq!(rules[1]["rows_skipped"], 0);
+    assert_eq!(rules[1]["rows_validation_skipped"], 1);
     assert_eq!(rules[1]["rows_failed"], 4);
 
     // `validation_skipped = any_in([...], [...])` skips row 7 (code SKIP).
-    assert_eq!(rules[2]["rows_skipped"], 1);
+    assert_eq!(rules[2]["rows_skipped"], 0);
+    assert_eq!(rules[2]["rows_validation_skipped"], 1);
     assert_eq!(rules[2]["rows_failed"], 3);
 
     // `mapping_filter = eq(category, "standard")` filters the *reference rows*:
@@ -377,7 +383,9 @@ fn parallel_matches_sequential() {
     std::fs::create_dir_all(&dir).unwrap();
     let csv_path = dir.join("data.csv");
 
-    let mut csv = String::from("id,country_name,country_code,start_date,end_date,tags,ref_tags,city,city_code\n");
+    let mut csv = String::from(
+        "id,country_name,country_code,start_date,end_date,tags,ref_tags,city,city_code\n",
+    );
     for i in 1..=5000u32 {
         let country = if i % 3 == 0 { "France" } else { "USA" };
         let code = if i % 97 == 0 { "FR" } else { "US" };
@@ -391,10 +399,28 @@ fn parallel_matches_sequential() {
     let rules = people_rules();
     let csv_str = csv_path.to_str().unwrap();
     let sequential = run_json(&[
-        csv_str, "-r", &rules, "--id-column", "id", "-j", "1", "--format", "json", "--no-fail",
+        csv_str,
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+        "-j",
+        "1",
+        "--format",
+        "json",
+        "--no-fail",
     ]);
     let parallel = run_json(&[
-        csv_str, "-r", &rules, "--id-column", "id", "-j", "4", "--format", "json", "--no-fail",
+        csv_str,
+        "-r",
+        &rules,
+        "--id-column",
+        "id",
+        "-j",
+        "4",
+        "--format",
+        "json",
+        "--no-fail",
     ]);
 
     assert_eq!(strip_rows(sequential), strip_rows(parallel));
@@ -426,10 +452,24 @@ fn parallel_without_id_keeps_row_numbers() {
     let rules = people_rules();
     let csv_str = csv_path.to_str().unwrap();
     let sequential = run_json(&[
-        csv_str, "-r", &rules, "-j", "1", "--format", "json", "--no-fail",
+        csv_str,
+        "-r",
+        &rules,
+        "-j",
+        "1",
+        "--format",
+        "json",
+        "--no-fail",
     ]);
     let parallel = run_json(&[
-        csv_str, "-r", &rules, "-j", "4", "--format", "json", "--no-fail",
+        csv_str,
+        "-r",
+        &rules,
+        "-j",
+        "4",
+        "--format",
+        "json",
+        "--no-fail",
     ]);
 
     // Row numbers are exact in both modes, so compare the reports verbatim.
@@ -442,7 +482,7 @@ fn parallel_without_id_keeps_row_numbers() {
 fn strip_rows(mut report: Value) -> Value {
     if let Some(rules) = report["rules"].as_array_mut() {
         for rule in rules {
-            for key in ["pass_examples", "fail_examples"] {
+            for key in ["pass_results", "fail_results"] {
                 if let Some(examples) = rule[key].as_array_mut() {
                     for example in examples {
                         example.as_object_mut().unwrap().remove("row");

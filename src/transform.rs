@@ -17,7 +17,10 @@ pub enum Transform {
     Collapse,
     /// Parse a date/datetime using one of `inputs` formats and re-emit using
     /// `output`. Both sides are normalized to the same textual representation.
-    Date { inputs: Vec<String>, output: String },
+    Date {
+        inputs: Vec<String>,
+        output: String,
+    },
     /// Parse an integer and re-emit its canonical form (drops leading zeros,
     /// plus signs, etc.).
     Int,
@@ -25,16 +28,27 @@ pub enum Transform {
     Float,
     /// Normalize common boolean spellings to `true` / `false`.
     Bool,
-    Replace { from: String, to: String },
+    Replace {
+        from: String,
+        to: String,
+    },
     /// Regex replacement (xan's `replace(string, regex(...), replacement)`),
     /// supporting capture groups in `replacement` (`$1`, `${name}`).
-    RegexReplace { pattern: Regex, replacement: String },
+    RegexReplace {
+        pattern: Regex,
+        replacement: String,
+    },
     /// Extract a capture group from the first regex match (xan's
     /// `match(string, regex(...), group)`). Group 0 is the whole match.
-    RegexExtract { pattern: Regex, group: usize },
+    RegexExtract {
+        pattern: Regex,
+        group: usize,
+    },
     /// Keep only the characters matching the regex (all non-overlapping
     /// matches concatenated).
-    RegexKeep { pattern: Regex },
+    RegexKeep {
+        pattern: Regex,
+    },
     Prefix(String),
     Suffix(String),
 }
@@ -406,7 +420,9 @@ mod tests {
         ] {
             let fast = fast_parse_date(value, fmt).expect("fast path should parse");
             let chrono = NaiveDateTime::parse_from_str(value, fmt)
-                .or_else(|_| NaiveDate::parse_from_str(value, fmt).map(|d| d.and_time(NaiveTime::MIN)))
+                .or_else(|_| {
+                    NaiveDate::parse_from_str(value, fmt).map(|d| d.and_time(NaiveTime::MIN))
+                })
                 .expect("chrono should parse");
             assert_eq!(fast, chrono, "{fmt} {value}");
         }
@@ -437,13 +453,22 @@ mod tests {
         let pipeline = vec![Transform::Trim, Transform::Lower];
         let mut out = String::new();
         let mut scratch = String::new();
-        assert!(apply_pipeline(&pipeline, "  HeLLo ", &mut out, &mut scratch));
+        assert!(apply_pipeline(
+            &pipeline,
+            "  HeLLo ",
+            &mut out,
+            &mut scratch
+        ));
         assert_eq!(out, "hello");
     }
 
     #[test]
     fn pipeline_of_three() {
-        let pipeline = vec![Transform::Trim, Transform::Upper, Transform::Suffix("!".into())];
+        let pipeline = vec![
+            Transform::Trim,
+            Transform::Upper,
+            Transform::Suffix("!".into()),
+        ];
         let mut out = String::new();
         let mut scratch = String::new();
         apply_pipeline(&pipeline, " ab ", &mut out, &mut scratch);

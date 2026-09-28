@@ -19,6 +19,19 @@ pub struct TargetExample {
     pub count: u64,
 }
 
+/// Matching or failing rows aggregated by their `(left, right, expected)`
+/// values. `count` is the number of rows in the group and `ids` holds up to
+/// `report_limit` example ids.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedExample {
+    pub left: String,
+    pub right: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    pub count: u64,
+    pub ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MappingEntry {
     pub input: String,
@@ -56,10 +69,16 @@ pub struct RuleReport {
     pub rows_passed: u64,
     pub rows_failed: u64,
     pub rows_skipped: u64,
+    /// Rows skipped by an explicit \`validation_skipped\` predicate.
+    pub rows_validation_skipped: u64,
     pub transform_errors: u64,
     pub unmapped_values: u64,
-    pub pass_examples: Vec<Example>,
-    pub fail_examples: Vec<Example>,
+    /// Matching rows aggregated by value, most frequent first (up to the
+    /// report limit).
+    pub pass_results: Vec<GroupedExample>,
+    /// Failing rows aggregated by value, most frequent first (up to the
+    /// report limit).
+    pub fail_results: Vec<GroupedExample>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<MappingReport>,
 }
@@ -110,25 +129,26 @@ impl Report {
             let _ = writeln!(out, "    right : {}", rule.right);
             let _ = writeln!(
                 out,
-                "    checked={} passed={} failed={} skipped={} transform_errors={} unmapped_values={}",
+                "    checked={} passed={} failed={} skipped={} validation_skipped={} transform_errors={} unmapped_values={}",
                 rule.rows_checked,
                 rule.rows_passed,
                 rule.rows_failed,
                 rule.rows_skipped,
+                rule.rows_validation_skipped,
                 rule.transform_errors,
                 rule.unmapped_values
             );
 
-            if !rule.pass_examples.is_empty() {
-                let _ = writeln!(out, "    matching rows ({}):", rule.pass_examples.len());
-                for example in &rule.pass_examples {
-                    let _ = writeln!(out, "      {}", format_example(example));
+            if !rule.pass_results.is_empty() {
+                let _ = writeln!(out, "    matching results ({}):", rule.pass_results.len());
+                for group in &rule.pass_results {
+                    let _ = writeln!(out, "      {}", format_group(group));
                 }
             }
-            if !rule.fail_examples.is_empty() {
-                let _ = writeln!(out, "    failed rows ({}):", rule.fail_examples.len());
-                for example in &rule.fail_examples {
-                    let _ = writeln!(out, "      {}", format_example(example));
+            if !rule.fail_results.is_empty() {
+                let _ = writeln!(out, "    failed results ({}):", rule.fail_results.len());
+                for group in &rule.fail_results {
+                    let _ = writeln!(out, "      {}", format_group(group));
                 }
             }
 
@@ -235,6 +255,7 @@ impl Report {
              <div class=\"table-scroll\"><table><thead><tr>\
              <th>target</th><th>source</th><th>rule</th><th>status</th>\
              <th>checked</th><th>passed</th><th>failed</th><th>skipped</th>\
+             <th>validation skipped</th>\
              </tr></thead><tbody>"
         );
         for &index in &order {
@@ -246,7 +267,8 @@ impl Report {
                  <td><a href=\"#rule-{anchor}\">{name}</a></td>\
                  <td><span class=\"badge {status}\">{status}</span></td>\
                  <td>{checked}</td><td class=\"pass\">{passed}</td>\
-                 <td class=\"fail\">{failed}</td><td>{skipped}</td></tr>",
+                 <td class=\"fail\">{failed}</td><td>{skipped}</td>\
+                 <td>{validation_skipped}</td></tr>",
                 target = html_escape(&rule.right),
                 source = html_escape(&rule.left),
                 anchor = index + 1,
@@ -255,6 +277,7 @@ impl Report {
                 passed = rule.rows_passed,
                 failed = rule.rows_failed,
                 skipped = rule.rows_skipped,
+                validation_skipped = rule.rows_validation_skipped,
             );
         }
         out.push_str("</tbody></table></div></nav>\n");
@@ -263,7 +286,10 @@ impl Report {
             let status = if rule.passed() { "passed" } else { "failed" };
             let anchor = index + 1;
 
-            let _ = writeln!(out, "<section class=\"rule {status}\" id=\"rule-{anchor}\">");
+            let _ = writeln!(
+                out,
+                "<section class=\"rule {status}\" id=\"rule-{anchor}\">"
+            );
             let _ = writeln!(
                 out,
                 "<header><h2>{anchor}. {name}</h2>\
@@ -283,31 +309,33 @@ impl Report {
                  <span class=\"pass\">passed <b>{}</b></span>\
                  <span class=\"fail\">failed <b>{}</b></span>\
                  <span>skipped <b>{}</b></span>\
+                 <span>validation skipped <b>{}</b></span>\
                  <span>transform errors <b>{}</b></span>\
                  <span>unmapped values <b>{}</b></span></div>",
                 rule.rows_checked,
                 rule.rows_passed,
                 rule.rows_failed,
                 rule.rows_skipped,
+                rule.rows_validation_skipped,
                 rule.transform_errors,
                 rule.unmapped_values,
             );
 
-            if !rule.pass_examples.is_empty() {
+            if !rule.pass_results.is_empty() {
                 let _ = writeln!(
                     out,
-                    "<h3 class=\"pass\">Matching rows ({})</h3>",
-                    rule.pass_examples.len()
+                    "<h3 class=\"pass\">Matching results ({})</h3>",
+                    rule.pass_results.len()
                 );
-                out.push_str(&html_examples_table(&rule.pass_examples));
+                out.push_str(&html_grouped_table(&rule.pass_results));
             }
-            if !rule.fail_examples.is_empty() {
+            if !rule.fail_results.is_empty() {
                 let _ = writeln!(
                     out,
-                    "<h3 class=\"fail\">Failed rows ({})</h3>",
-                    rule.fail_examples.len()
+                    "<h3 class=\"fail\">Failed results ({})</h3>",
+                    rule.fail_results.len()
                 );
-                out.push_str(&html_examples_table(&rule.fail_examples));
+                out.push_str(&html_grouped_table(&rule.fail_results));
             }
 
             if let Some(mapping) = &rule.mapping {
@@ -367,7 +395,7 @@ const HTML_CSS: &str = r#"
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
 body { margin: 0; font: 15px/1.55 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; background: #f5f6f8; color: #1f2430; }
-main { max-width: 1040px; margin: 0 auto; padding: 24px 16px 64px; }
+main { max-width: 1200px; margin: 0 auto; padding: 24px 16px 64px; }
 h1 { margin: 0 0 4px; font-size: 26px; }
 .subtitle { margin: 0 0 20px; color: #6b7280; }
 code { background: rgba(127,127,127,.16); padding: 1px 5px; border-radius: 4px; font-size: .9em; }
@@ -450,6 +478,26 @@ fn html_examples_table(examples: &[Example]) -> String {
     out
 }
 
+fn html_grouped_table(groups: &[GroupedExample]) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "<table><thead><tr><th>count</th><th>left</th><th>right</th><th>expected</th><th>ids</th></tr></thead><tbody>",
+    );
+    for group in groups {
+        let ids: Vec<String> = group.ids.iter().map(|id| html_escape(id)).collect();
+        out.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            group.count,
+            html_escape(&group.left),
+            html_escape(&group.right),
+            html_escape(group.expected.as_deref().unwrap_or("")),
+            ids.join(", "),
+        ));
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
 fn html_mapping_table(entries: &[MappingEntry]) -> String {
     let mut out = String::new();
     out.push_str(
@@ -485,6 +533,19 @@ fn html_escape(value: &str) -> String {
             _ => out.push(c),
         }
     }
+    out
+}
+
+fn format_group(group: &GroupedExample) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("count={} ", group.count));
+    out.push_str(&format!("left={}", quote(&group.left)));
+    out.push_str(&format!(" right={}", quote(&group.right)));
+    if let Some(expected) = &group.expected {
+        out.push_str(&format!(" expected={}", quote(expected)));
+    }
+    let ids: Vec<String> = group.ids.iter().map(|id| quote(id)).collect();
+    out.push_str(&format!(" ids=[{}]", ids.join(", ")));
     out
 }
 

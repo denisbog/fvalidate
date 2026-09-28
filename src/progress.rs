@@ -80,7 +80,11 @@ impl Progress {
         self.draw();
         let done = self.done.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let rate = if elapsed > 0.0 {
+            done as f64 / elapsed
+        } else {
+            0.0
+        };
         let mut stderr = io::stderr().lock();
         let _ = writeln!(
             stderr,
@@ -96,7 +100,11 @@ impl Progress {
         let done = self.done.load(Ordering::Relaxed);
         let total = self.total.load(Ordering::Relaxed);
         let elapsed = self.started.elapsed().as_secs_f64();
-        let rate = if elapsed > 0.0 { done as f64 / elapsed } else { 0.0 };
+        let rate = if elapsed > 0.0 {
+            done as f64 / elapsed
+        } else {
+            0.0
+        };
 
         let ratio = if total > 0 {
             (done as f64 / total as f64).clamp(0.0, 1.0)
@@ -134,7 +142,11 @@ impl Progress {
                 eta
             ));
         } else {
-            line.push_str(&format!("{}  {}/s", human_bytes(done), human_bytes(rate as u64)));
+            line.push_str(&format!(
+                "{}  {}/s",
+                human_bytes(done),
+                human_bytes(rate as u64)
+            ));
         }
 
         let mut stderr = io::stderr().lock();

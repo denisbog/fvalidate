@@ -202,7 +202,11 @@ impl MappingCache {
         Self::default()
     }
 
-    pub fn load(&mut self, files: &[PathBuf], spec: &FileMappingSpec) -> Result<Arc<Mapping>, String> {
+    pub fn load(
+        &mut self,
+        files: &[PathBuf],
+        spec: &FileMappingSpec,
+    ) -> Result<Arc<Mapping>, String> {
         if files.is_empty() {
             return Err("mapping_files is set but no files were provided".to_string());
         }
@@ -269,17 +273,39 @@ impl MappingCache {
                     &mut part_buf,
                     &mut left_key,
                 );
-                crate::transform::compose(
-                    right_idx
-                        .iter()
-                        .map(|&i| row.get(i).map(String::as_str).unwrap_or("")),
-                    spec.right_transforms,
-                    spec.join_separator,
-                    spec.trim,
-                    &mut right_scratch,
-                    &mut part_buf,
-                    &mut right_key,
-                );
+                // Several `mapping_right` columns form a priority list instead
+                // of a composite value: the first non-empty one, scanning right
+                // to left, becomes the target. A single column keeps the
+                // existing behaviour.
+                if right_idx.len() > 1 {
+                    right_key.clear();
+                    for &i in right_idx.iter().rev() {
+                        let raw = row.get(i).map(String::as_str).unwrap_or("");
+                        let cell = if spec.trim { raw.trim() } else { raw };
+                        crate::transform::apply_pipeline(
+                            spec.right_transforms,
+                            cell,
+                            &mut right_scratch,
+                            &mut part_buf,
+                        );
+                        if !right_scratch.trim().is_empty() {
+                            right_key.push_str(&right_scratch);
+                            break;
+                        }
+                    }
+                } else {
+                    crate::transform::compose(
+                        right_idx
+                            .iter()
+                            .map(|&i| row.get(i).map(String::as_str).unwrap_or("")),
+                        spec.right_transforms,
+                        spec.join_separator,
+                        spec.trim,
+                        &mut right_scratch,
+                        &mut part_buf,
+                        &mut right_key,
+                    );
+                }
 
                 let left_tokens = split_tokens(&left_key, spec.multi, spec.value_separator);
                 let right_tokens = split_tokens(&right_key, spec.multi, spec.value_separator);
@@ -415,7 +441,10 @@ mod tests {
     }
 
     fn path() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/loose_map.csv"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/loose_map.csv"
+        ))
     }
 
     #[test]

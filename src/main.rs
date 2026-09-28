@@ -1,6 +1,7 @@
 mod compare;
 mod dsl;
 mod engine;
+mod expr;
 mod mapping;
 mod pattern;
 mod progress;

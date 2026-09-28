@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use regex::Regex;
 
 use crate::compare::CompareOp;
+use crate::expr::{self, DerivedDef};
 use crate::pattern::Separator;
 use crate::transform::Transform;
 
@@ -119,19 +120,38 @@ impl ColumnSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Predicate {
     /// `in(col, ["a", "b"])`: the value is one of the listed strings.
-    In { column: ColumnSpec, values: Vec<String> },
+    In {
+        column: ColumnSpec,
+        values: Vec<String>,
+    },
     /// `any_in([a, b], [...])`: at least one column is one of the values.
-    AnyIn { columns: Vec<ColumnSpec>, values: Vec<String> },
+    AnyIn {
+        columns: Vec<ColumnSpec>,
+        values: Vec<String>,
+    },
     /// `all_in([a, b], [...])`: every column is one of the values.
-    AllIn { columns: Vec<ColumnSpec>, values: Vec<String> },
+    AllIn {
+        columns: Vec<ColumnSpec>,
+        values: Vec<String>,
+    },
     /// `eq(col, "value")`.
-    Eq { column: ColumnSpec, value: String },
+    Eq {
+        column: ColumnSpec,
+        value: String,
+    },
     /// `ne(col, "value")`.
-    Ne { column: ColumnSpec, value: String },
+    Ne {
+        column: ColumnSpec,
+        value: String,
+    },
     /// `empty(col)`.
-    Empty { column: ColumnSpec },
+    Empty {
+        column: ColumnSpec,
+    },
     /// `not_empty(col)`.
-    NotEmpty { column: ColumnSpec },
+    NotEmpty {
+        column: ColumnSpec,
+    },
     And(Vec<Predicate>),
     Or(Vec<Predicate>),
     Not(Box<Predicate>),
@@ -197,6 +217,8 @@ pub struct RuleDef {
     pub right: ColumnSpec,
     pub transform_left: Vec<Transform>,
     pub transform_right: Vec<Transform>,
+    /// Xan/moonblade-style expressions computing named values per row.
+    pub derive: Vec<DerivedDef>,
     pub compare: Option<CompareOp>,
     pub multi: Option<bool>,
     pub separator: Option<Separator>,
@@ -284,6 +306,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     right: ColumnSpec::Columns(Vec::new()),
                     transform_left: Vec::new(),
                     transform_right: Vec::new(),
+                    derive: Vec::new(),
                     compare: None,
                     multi: None,
                     separator: None,
@@ -314,8 +337,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {line_no}: expected `key = value`"))?;
         let key = key.trim();
-        let value = parse_value(value.trim())
-            .map_err(|e| format!("line {line_no}: {e}"))?;
+        let value = parse_value(value.trim()).map_err(|e| format!("line {line_no}: {e}"))?;
 
         match module {
             Some(Module::Defaults) => apply_default(&mut defaults, key, &value, line_no)?,
@@ -394,6 +416,11 @@ fn apply_rule_key(
         "right" => rule.right = expect_columns(value, key, line_no)?,
         "transform_left" => rule.transform_left = parse_transforms(value, line_no)?,
         "transform_right" => rule.transform_right = parse_transforms(value, line_no)?,
+        "derive" => {
+            let source = expect_string_ref(value, key, line_no)?;
+            rule.derive = expr::parse_derive(source)
+                .map_err(|e| format!("line {line_no}: invalid derive expression: {e}"))?;
+        }
         "compare" => {
             rule.compare = Some(
                 CompareOp::parse(expect_string_ref(value, key, line_no)?)
@@ -525,11 +552,7 @@ fn parse_separator(value: &Value, key: &str, line_no: usize) -> Result<Separator
 /// Accept either a single string or a list of strings. Used for `left`,
 /// `right`, `mapping_left` and `mapping_right`, which can name one or several
 /// columns (composite keys).
-fn expect_string_or_list(
-    value: &Value,
-    key: &str,
-    line_no: usize,
-) -> Result<Vec<String>, String> {
+fn expect_string_or_list(value: &Value, key: &str, line_no: usize) -> Result<Vec<String>, String> {
     match value {
         Value::List(items) => {
             if items.is_empty() {
@@ -566,9 +589,7 @@ fn expect_columns(value: &Value, key: &str, line_no: usize) -> Result<ColumnSpec
             let mut names = Vec::new();
             for arg in args {
                 match arg {
-                    Value::List(items) => {
-                        names.extend(parse_column_names(items, key, line_no)?)
-                    }
+                    Value::List(items) => names.extend(parse_column_names(items, key, line_no)?),
                     other => names.push(
                         other
                             .as_str()
@@ -602,17 +623,13 @@ fn is_or_name(name: &str) -> bool {
     )
 }
 
-fn parse_column_names(
-    items: &[Value],
-    key: &str,
-    line_no: usize,
-) -> Result<Vec<String>, String> {
+fn parse_column_names(items: &[Value], key: &str, line_no: usize) -> Result<Vec<String>, String> {
     items
         .iter()
         .map(|item| {
-            item.as_str().map(str::to_string).ok_or_else(|| {
-                format!("line {line_no}: `{key}` list must contain column names")
-            })
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| format!("line {line_no}: `{key}` list must contain column names"))
         })
         .collect()
 }
@@ -708,7 +725,9 @@ fn parse_predicate(value: &Value, key: &str, line_no: usize) -> Result<Predicate
 
 fn flatten_predicates(args: &[Value], key: &str, line_no: usize) -> Result<Vec<Predicate>, String> {
     if args.is_empty() {
-        return Err(format!("line {line_no}: `{key}` needs at least one predicate"));
+        return Err(format!(
+            "line {line_no}: `{key}` needs at least one predicate"
+        ));
     }
     let mut out = Vec::new();
     for arg in args {
@@ -751,9 +770,9 @@ fn expect_value_list(value: &Value, key: &str, line_no: usize) -> Result<Vec<Str
         Value::List(items) => items
             .iter()
             .map(|item| {
-                item.as_str().map(str::to_string).ok_or_else(|| {
-                    format!("line {line_no}: `{key}` list must contain strings")
-                })
+                item.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("line {line_no}: `{key}` list must contain strings"))
             })
             .collect(),
         other => other
@@ -840,7 +859,9 @@ fn parse_transform(value: &Value, line_no: usize) -> Result<Option<Transform>, S
             }
             "replace" => {
                 if args.len() != 2 {
-                    return Err(format!("line {line_no}: replace(from, to) expects 2 arguments"));
+                    return Err(format!(
+                        "line {line_no}: replace(from, to) expects 2 arguments"
+                    ));
                 }
                 // xan-style: `replace(regex("p"), "r")` performs a regex
                 // replacement with capture-group references; a plain string is
@@ -870,9 +891,9 @@ fn parse_transform(value: &Value, line_no: usize) -> Result<Option<Transform>, S
                 })
             }
             "match" | "capture" => {
-                let first = args
-                    .first()
-                    .ok_or_else(|| format!("line {line_no}: match(pattern[, group]) needs an argument"))?;
+                let first = args.first().ok_or_else(|| {
+                    format!("line {line_no}: match(pattern[, group]) needs an argument")
+                })?;
                 let source = regex_pattern(first, "match", line_no)?;
                 let group = match args.get(1) {
                     Some(value) => expect_usize(value, "match", line_no)?,
@@ -884,9 +905,9 @@ fn parse_transform(value: &Value, line_no: usize) -> Result<Option<Transform>, S
                 })
             }
             "regex_keep" | "keep" => {
-                let first = args
-                    .first()
-                    .ok_or_else(|| format!("line {line_no}: regex_keep(pattern) needs an argument"))?;
+                let first = args.first().ok_or_else(|| {
+                    format!("line {line_no}: regex_keep(pattern) needs an argument")
+                })?;
                 let source = regex_pattern(first, "regex_keep", line_no)?;
                 Ok(Transform::RegexKeep {
                     pattern: compile_regex(&source, line_no)?,
@@ -904,12 +925,14 @@ fn parse_transform(value: &Value, line_no: usize) -> Result<Option<Transform>, S
                 })
             }
             "prefix" => Ok(Transform::Prefix(expect_string(
-                args.first().ok_or_else(|| format!("line {line_no}: prefix() needs 1 argument"))?,
+                args.first()
+                    .ok_or_else(|| format!("line {line_no}: prefix() needs 1 argument"))?,
                 "prefix",
                 line_no,
             )?)),
             "suffix" => Ok(Transform::Suffix(expect_string(
-                args.first().ok_or_else(|| format!("line {line_no}: suffix() needs 1 argument"))?,
+                args.first()
+                    .ok_or_else(|| format!("line {line_no}: suffix() needs 1 argument"))?,
                 "suffix",
                 line_no,
             )?)),
@@ -1214,7 +1237,9 @@ mod tests {
         assert_eq!(program.rules[0].transform_left.len(), 2);
         assert!(matches!(program.rules[0].mapping, MappingSourceDef::Auto));
         match &program.rules[1].mapping {
-            MappingSourceDef::Files { files, left, right, .. } => {
+            MappingSourceDef::Files {
+                files, left, right, ..
+            } => {
                 assert_eq!(files.len(), 2);
                 assert_eq!(left, &["name".to_string()]);
                 assert_eq!(right, &["code".to_string()]);
@@ -1227,7 +1252,10 @@ mod tests {
     fn parses_values() {
         assert_eq!(parse_value("\"a,b\"").unwrap(), Value::Str("a,b".into()));
         assert!(matches!(parse_value("[a, b]").unwrap(), Value::List(_)));
-        assert!(matches!(parse_value("date(\"%Y\", \"%Y\")").unwrap(), Value::Call(..)));
+        assert!(matches!(
+            parse_value("date(\"%Y\", \"%Y\")").unwrap(),
+            Value::Call(..)
+        ));
         assert!(matches!(parse_value("a | b").unwrap(), Value::Pipeline(_)));
     }
 
@@ -1245,10 +1273,7 @@ mod tests {
         "#;
         let program = parse(src).unwrap();
         let rule = &program.rules[0];
-        assert_eq!(
-            rule.left,
-            ColumnSpec::Columns(vec!["a".into(), "b".into()])
-        );
+        assert_eq!(rule.left, ColumnSpec::Columns(vec!["a".into(), "b".into()]));
         assert_eq!(rule.right, ColumnSpec::Columns(vec!["c".into()]));
         assert_eq!(rule.join_separator.as_deref(), Some("|"));
         match &rule.mapping {
@@ -1277,7 +1302,10 @@ mod tests {
         assert!(matches!(program.defaults.separator, Separator::Regex(_)));
         let rule = &program.rules[0];
         assert_eq!(rule.transform_left.len(), 2);
-        assert!(matches!(rule.transform_left[0], Transform::RegexReplace { .. }));
+        assert!(matches!(
+            rule.transform_left[0],
+            Transform::RegexReplace { .. }
+        ));
         assert!(matches!(
             rule.transform_left[1],
             Transform::RegexExtract { group: 1, .. }
@@ -1301,7 +1329,10 @@ mod tests {
 
     #[test]
     fn comments_and_quotes() {
-        assert_eq!(strip_comment(r#"a = "x # y" # real comment"#).trim(), r#"a = "x # y""#);
+        assert_eq!(
+            strip_comment(r#"a = "x # y" # real comment"#).trim(),
+            r#"a = "x # y""#
+        );
     }
 
     #[test]
@@ -1328,7 +1359,10 @@ mod tests {
                 "country_en".into()
             ])
         );
-        assert_eq!(program.rules[0].left.display(), "or(country_name, country_short, country_en)");
+        assert_eq!(
+            program.rules[0].left.display(),
+            "or(country_name, country_short, country_en)"
+        );
     }
 
     #[test]

@@ -6,6 +6,7 @@ use regex::Regex;
 
 use crate::compare::CompareOp;
 use crate::dsl::{ColumnSpec, MappingSourceDef, Predicate, Program};
+use crate::expr::{BinOp, Expr, ValueRef};
 use crate::pattern::Separator;
 use crate::transform::Transform;
 
@@ -51,18 +52,28 @@ pub enum MappingPlan {
     },
 }
 
-/// A resolved side of a rule: one or more column indices, or a fallback list
-/// where the first non-empty column wins.
+/// A resolved side of a rule: one or more value references (an input column or
+/// a value produced by `derive`), or a fallback list where the first non-empty
+/// value wins.
 #[derive(Debug, Clone)]
 pub enum ColumnRef {
-    Columns(Vec<usize>),
-    Or(Vec<usize>),
+    Columns(Vec<ValueRef>),
+    Or(Vec<ValueRef>),
 }
 
 impl ColumnRef {
-    pub fn indices(&self) -> &[usize] {
+    pub fn references(&self) -> &[ValueRef] {
         match self {
-            ColumnRef::Columns(indices) | ColumnRef::Or(indices) => indices,
+            ColumnRef::Columns(values) | ColumnRef::Or(values) => values,
+        }
+    }
+
+    /// Append every referenced input column index (derived values excluded).
+    pub fn collect_columns(&self, out: &mut Vec<usize>) {
+        for reference in self.references() {
+            if let ValueRef::Column(index) = reference {
+                out.push(*index);
+            }
         }
     }
 }
@@ -70,13 +81,32 @@ impl ColumnRef {
 /// A compiled row predicate. All column references are resolved to indices.
 #[derive(Debug, Clone)]
 pub enum CompiledPredicate {
-    In { column: ColumnRef, values: Vec<String> },
-    AnyIn { columns: Vec<ColumnRef>, values: Vec<String> },
-    AllIn { columns: Vec<ColumnRef>, values: Vec<String> },
-    Eq { column: ColumnRef, value: String },
-    Ne { column: ColumnRef, value: String },
-    Empty { column: ColumnRef },
-    NotEmpty { column: ColumnRef },
+    In {
+        column: ColumnRef,
+        values: Vec<String>,
+    },
+    AnyIn {
+        columns: Vec<ColumnRef>,
+        values: Vec<String>,
+    },
+    AllIn {
+        columns: Vec<ColumnRef>,
+        values: Vec<String>,
+    },
+    Eq {
+        column: ColumnRef,
+        value: String,
+    },
+    Ne {
+        column: ColumnRef,
+        value: String,
+    },
+    Empty {
+        column: ColumnRef,
+    },
+    NotEmpty {
+        column: ColumnRef,
+    },
     And(Vec<CompiledPredicate>),
     Or(Vec<CompiledPredicate>),
     Not(Box<CompiledPredicate>),
@@ -91,10 +121,10 @@ impl CompiledPredicate {
             | CompiledPredicate::Eq { column, .. }
             | CompiledPredicate::Ne { column, .. }
             | CompiledPredicate::Empty { column }
-            | CompiledPredicate::NotEmpty { column } => out.extend_from_slice(column.indices()),
+            | CompiledPredicate::NotEmpty { column } => column.collect_columns(out),
             CompiledPredicate::AnyIn { columns, .. } | CompiledPredicate::AllIn { columns, .. } => {
                 for column in columns {
-                    out.extend_from_slice(column.indices());
+                    column.collect_columns(out);
                 }
             }
             CompiledPredicate::And(parts) | CompiledPredicate::Or(parts) => {
@@ -147,15 +177,33 @@ where
 {
     let normalize = |value: &'a str| if trim { value.trim() } else { value };
     match side {
-        ColumnRef::Columns(columns) => {
-            let value = normalize(get(columns[0]));
+        ColumnRef::Columns(values) => {
+            let value = normalize(reference_value(values.first(), get));
             (!value.is_empty()).then_some(value)
         }
-        ColumnRef::Or(columns) => columns
+        ColumnRef::Or(values) => values
             .iter()
-            .map(|&column| normalize(get(column)))
+            .map(|value| normalize(reference_value(Some(value), get)))
             .find(|value| !value.is_empty()),
     }
+}
+
+/// A predicate can only reference input columns, so a derived value (if one
+/// somehow reached here) resolves to the empty string.
+fn reference_value<'a, F>(reference: Option<&ValueRef>, get: &F) -> &'a str
+where
+    F: Fn(usize) -> &'a str,
+{
+    match reference {
+        Some(ValueRef::Column(index)) => get(*index),
+        _ => "",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompiledDerived {
+    pub names: Vec<String>,
+    pub expr: Expr,
 }
 
 #[derive(Debug, Clone)]
@@ -164,11 +212,13 @@ pub struct CompiledRule {
     /// Human-readable, e.g. `product + region` for composite keys.
     pub left_name: String,
     pub right_name: String,
-    /// One or more columns per side; `Or` picks the first non-empty one.
+    /// One or more values per side; `Or` picks the first non-empty one.
     pub left: ColumnRef,
     pub right: ColumnRef,
     pub transform_left: Vec<Transform>,
     pub transform_right: Vec<Transform>,
+    /// Named values computed from the row before the comparison.
+    pub derive: Vec<CompiledDerived>,
     pub compare: CompareOp,
     pub multi: bool,
     pub separator: Separator,
@@ -196,16 +246,23 @@ fn resolve_all(
     side: &str,
     columns: &[String],
     headers: &[String],
-) -> Result<Vec<usize>, String> {
+    derived: &[String],
+) -> Result<Vec<ValueRef>, String> {
     columns
         .iter()
         .map(|column| {
-            ColumnResolver::resolve(column, headers).ok_or_else(|| {
-                format!(
-                    "{context}: {side} column '{column}' not found (available: {})",
-                    headers.join(", ")
-                )
-            })
+            // A `derive`d name shadows an input column of the same name.
+            if let Some(index) = derived.iter().position(|name| name == column) {
+                return Ok(ValueRef::Derived(index));
+            }
+            ColumnResolver::resolve(column, headers)
+                .map(ValueRef::Column)
+                .ok_or_else(|| {
+                    format!(
+                        "{context}: {side} column '{column}' not found (available: {})",
+                        headers.join(", ")
+                    )
+                })
         })
         .collect()
 }
@@ -215,11 +272,12 @@ fn compile_columns(
     side: &str,
     spec: &ColumnSpec,
     headers: &[String],
+    derived: &[String],
 ) -> Result<ColumnRef, String> {
-    let indices = resolve_all(context, side, spec.names(), headers)?;
+    let references = resolve_all(context, side, spec.names(), headers, derived)?;
     Ok(match spec {
-        ColumnSpec::Columns(_) => ColumnRef::Columns(indices),
-        ColumnSpec::Or(_) => ColumnRef::Or(indices),
+        ColumnSpec::Columns(_) => ColumnRef::Columns(references),
+        ColumnSpec::Or(_) => ColumnRef::Or(references),
     })
 }
 
@@ -237,7 +295,7 @@ fn compile_condition_column(
             ));
         }
     }
-    compile_columns(context, "condition", spec, headers)
+    compile_columns(context, "condition", spec, headers, &[])
 }
 
 /// Compile a DSL predicate against a set of headers. `context` labels any
@@ -299,13 +357,155 @@ pub fn compile_predicate(
     })
 }
 
+/// Resolve the identifiers of a `derive` expression against earlier derived
+/// names (first) and input headers (second).
+///
+/// `in_any(...)` calls are resolved here too: `in_any([a, b, c], [accepted...])`
+/// becomes a disjunction of plain membership tests.
+fn resolve_expr(
+    context: &str,
+    expr: &mut Expr,
+    headers: &[String],
+    derived: &[String],
+) -> Result<(), String> {
+    if let Expr::Call { name, args } = expr {
+        if name == "in_any" {
+            let mut args = args.clone();
+            if args.len() != 2 {
+                return Err(format!(
+                    "{context}: in_any(values, accepted) expects 2 arguments, got {}",
+                    args.len()
+                ));
+            }
+            let values = match args.remove(0) {
+                Expr::List(values) => values,
+                _ => {
+                    return Err(format!(
+                        "{context}: in_any(values, accepted) expects a list of value expressions"
+                    ))
+                }
+            };
+            let accepted = args.remove(0);
+            *expr = resolve_in_any(context, values, &accepted, headers, derived)?;
+            return Ok(());
+        }
+    }
+
+    match expr {
+        Expr::Ident(name) => {
+            if let Some(index) = derived.iter().position(|value| value == name) {
+                *expr = Expr::Ref(ValueRef::Derived(index));
+            } else if let Some(index) = ColumnResolver::resolve(name, headers) {
+                *expr = Expr::Ref(ValueRef::Column(index));
+            } else {
+                return Err(format!(
+                    "{context}: derive expression references unknown column or value '{name}'"
+                ));
+            }
+        }
+        Expr::List(items) => items
+            .iter_mut()
+            .try_for_each(|item| resolve_expr(context, item, headers, derived))?,
+        Expr::Call { args, .. } => args
+            .iter_mut()
+            .try_for_each(|arg| resolve_expr(context, arg, headers, derived))?,
+        Expr::Binary { lhs, rhs, .. } => {
+            resolve_expr(context, lhs, headers, derived)?;
+            resolve_expr(context, rhs, headers, derived)?;
+        }
+        Expr::Unary { operand, .. } => resolve_expr(context, operand, headers, derived)?,
+        Expr::Index { target, index } => {
+            resolve_expr(context, target, headers, derived)?;
+            resolve_expr(context, index, headers, derived)?;
+        }
+        Expr::Slice { target, start, end } => {
+            resolve_expr(context, target, headers, derived)?;
+            if let Some(start) = start {
+                resolve_expr(context, start, headers, derived)?;
+            }
+            if let Some(end) = end {
+                resolve_expr(context, end, headers, derived)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn resolve_in_any(
+    context: &str,
+    values: Vec<Expr>,
+    accepted: &Expr,
+    headers: &[String],
+    derived: &[String],
+) -> Result<Expr, String> {
+    if values.is_empty() {
+        return Err(format!("{context}: in_any values list must not be empty"));
+    }
+
+    let accepted_values = literal_string_list(context, "accepted values", accepted)?;
+    let accepted_list = Expr::List(accepted_values.into_iter().map(Expr::Str).collect());
+
+    let mut result: Option<Expr> = None;
+    for mut value in values {
+        resolve_expr(context, &mut value, headers, derived)?;
+        let test = Expr::Binary {
+            op: BinOp::In,
+            lhs: Box::new(value),
+            rhs: Box::new(accepted_list.clone()),
+        };
+        result = Some(match result {
+            None => test,
+            Some(previous) => Expr::Binary {
+                op: BinOp::Or,
+                lhs: Box::new(previous),
+                rhs: Box::new(test),
+            },
+        });
+    }
+
+    Ok(result.expect("values is non-empty"))
+}
+
+fn literal_string(context: &str, what: &str, expr: &Expr) -> Result<String, String> {
+    match expr {
+        Expr::Str(value) => Ok(value.clone()),
+        _ => Err(format!("{context}: in_any {what} must be a string literal")),
+    }
+}
+
+fn literal_string_list(context: &str, what: &str, expr: &Expr) -> Result<Vec<String>, String> {
+    match expr {
+        Expr::List(items) => items
+            .iter()
+            .map(|item| literal_string(context, what, item))
+            .collect(),
+        _ => Err(format!("{context}: in_any {what} must be a list of strings")),
+    }
+}
+
 pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
     let mut rules = Vec::with_capacity(program.rules.len());
 
     for def in program.rules {
         let context = format!("rule '{}'", def.name);
-        let left = compile_columns(&context, "left", &def.left, headers)?;
-        let right = compile_columns(&context, "right", &def.right, headers)?;
+
+        // Resolve `derive` clauses in order; each may reference the names
+        // produced by an earlier clause as well as input columns.
+        let mut derived_names: Vec<String> = Vec::new();
+        let mut derive = Vec::with_capacity(def.derive.len());
+        for derived in def.derive {
+            let mut expr = derived.expr;
+            resolve_expr(&context, &mut expr, headers, &derived_names)?;
+            derived_names.extend(derived.names.iter().cloned());
+            derive.push(CompiledDerived {
+                names: derived.names,
+                expr,
+            });
+        }
+
+        let left = compile_columns(&context, "left", &def.left, headers, &derived_names)?;
+        let right = compile_columns(&context, "right", &def.right, headers, &derived_names)?;
         let skip = def
             .skip
             .as_ref()
@@ -403,6 +603,7 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             right,
             transform_left: def.transform_left,
             transform_right: def.transform_right,
+            derive,
             compare,
             multi,
             separator,

@@ -9,8 +9,11 @@
 //!   rayon worker — the same strategy xan uses for parallel commands;
 //! * rules are compiled to integer column indices once, and the hot loop only
 //!   does O(1) indexing and cheap `Cow` transforms;
-//! * example rows are sampled with a bounded, distinct, deterministic reservoir
-//!   so a gigabyte file never grows the memory footprint.
+//! * matching/failing rows are aggregated by their `(left, right, expected)`
+//!   values, and each group keeps a bounded, deterministic sample of ids;
+//!   ambiguity examples use the same bounded min-hash reservoir. The number of
+//!   distinct result groups follows the data cardinality, as in the
+//!   development branch.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -23,14 +26,16 @@ use regex::Regex;
 use simd_csv::ByteRecord;
 
 use crate::compare::CompareOp;
+use crate::expr::{self, EvalContext, Expr, Value, ValueRef};
 use crate::mapping::{self, MapCounts, Mapping, MappingOrigin};
 use crate::pattern::Separator;
 use crate::progress::Progress;
 use crate::report::{
-    AmbiguityReport, Example, MappingEntry, MappingReport, Report, RuleReport, TargetExample,
+    AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RuleReport,
+    TargetExample,
 };
 use crate::rules::{ColumnRef, CompiledPredicate, MappingPlan, Plan};
-use crate::sampler::Sampler;
+use crate::sampler::{fnv1a, Sampler};
 use crate::transform::{compose, Transform};
 
 const BUFFER_CAPACITY: usize = 64 * 1024;
@@ -62,11 +67,7 @@ pub fn read_headers(path: &Path, delimiter: u8) -> Result<Vec<String>, String> {
 }
 
 /// Compute record-aligned byte segments for parallel processing.
-pub fn segments_for(
-    path: &Path,
-    delimiter: u8,
-    count: usize,
-) -> Result<Vec<(u64, u64)>, String> {
+pub fn segments_for(path: &Path, delimiter: u8, count: usize) -> Result<Vec<(u64, u64)>, String> {
     let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
 
     let mut builder = simd_csv::SeekerBuilder::new();
@@ -132,15 +133,119 @@ fn open_segment(
 // Accumulators
 // ---------------------------------------------------------------------------
 
+/// Aggregates matching/failing rows by their `(left, right, expected)` values
+/// and keeps up to `limit` example ids per group. Groups are merged across
+/// parallel segments and the most frequent groups are reported first.
+type GroupKey = (String, String, Option<String>);
+
+#[derive(Default)]
+struct GroupEntry {
+    count: u64,
+    /// Up to `limit` ids with the smallest FNV-1a hash, sorted by hash so the
+    /// retained sample is deterministic and independent of segment order.
+    ids: Vec<(u64, String)>,
+}
+
+struct ResultGroups {
+    /// Zero disables collection entirely (report limit of zero).
+    limit: usize,
+    groups: HashMap<GroupKey, GroupEntry>,
+}
+
+impl ResultGroups {
+    fn new(limit: usize) -> Self {
+        ResultGroups {
+            limit,
+            groups: HashMap::new(),
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.limit == 0
+    }
+
+    /// Record one matching or failing row under its `(left, right, expected)`
+    /// condition, keeping up to `limit` example ids for that condition.
+    fn observe(&mut self, left: &str, right: &str, expected: Option<&str>, id: &str) {
+        if self.limit == 0 {
+            return;
+        }
+        let entry = self
+            .groups
+            .entry((
+                left.to_string(),
+                right.to_string(),
+                expected.map(str::to_string),
+            ))
+            .or_default();
+        entry.count += 1;
+        offer_id(&mut entry.ids, self.limit, id);
+    }
+
+    fn merge(&mut self, other: ResultGroups) {
+        if other.limit > self.limit {
+            self.limit = other.limit;
+        }
+        for (key, other_entry) in other.groups {
+            let entry = self.groups.entry(key).or_default();
+            entry.count += other_entry.count;
+            for (_, id) in other_entry.ids {
+                offer_id(&mut entry.ids, self.limit, &id);
+            }
+        }
+    }
+
+    /// The `limit` most frequent groups, most frequent first (ties broken by
+    /// value, so the report is deterministic).
+    fn top(&self) -> Vec<GroupedExample> {
+        let mut list: Vec<(&GroupKey, &GroupEntry)> = self.groups.iter().collect();
+        list.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        list.into_iter()
+            .take(self.limit)
+            .map(|(key, entry)| GroupedExample {
+                left: key.0.clone(),
+                right: key.1.clone(),
+                expected: key.2.clone(),
+                count: entry.count,
+                ids: entry.ids.iter().map(|(_, id)| id.clone()).collect(),
+            })
+            .collect()
+    }
+}
+
+/// Keep the `limit` smallest-hash ids, sorted by hash. Using a hash order (and
+/// not the encounter order) makes the retained sample deterministic when
+/// parallel segments are merged in arbitrary order.
+fn offer_id(ids: &mut Vec<(u64, String)>, limit: usize, id: &str) {
+    if limit == 0 || ids.iter().any(|(_, existing)| existing == id) {
+        return;
+    }
+    let hash = fnv1a(id.as_bytes());
+    if ids.len() < limit {
+        let pos = ids.partition_point(|(h, _)| *h < hash);
+        ids.insert(pos, (hash, id.to_string()));
+        return;
+    }
+    if let Some(&(worst, _)) = ids.last() {
+        if hash < worst {
+            ids.pop();
+            let pos = ids.partition_point(|(h, _)| *h < hash);
+            ids.insert(pos, (hash, id.to_string()));
+        }
+    }
+}
+
 struct RuleAccum {
     checked: u64,
     passed: u64,
     failed: u64,
     skipped: u64,
+    /// Rows skipped by an explicit `validation_skipped` predicate.
+    validation_skipped: u64,
     transform_errors: u64,
     unmapped: u64,
-    pass_samples: Sampler<Example>,
-    fail_samples: Sampler<Example>,
+    pass_results: ResultGroups,
+    fail_results: ResultGroups,
     /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
     /// reported.
     ambiguous_samples: Sampler<Example>,
@@ -153,10 +258,11 @@ impl RuleAccum {
             passed: 0,
             failed: 0,
             skipped: 0,
+            validation_skipped: 0,
             transform_errors: 0,
             unmapped: 0,
-            pass_samples: Sampler::new(limit),
-            fail_samples: Sampler::new(limit),
+            pass_results: ResultGroups::new(limit),
+            fail_results: ResultGroups::new(limit),
             ambiguous_samples: Sampler::new(limit),
         }
     }
@@ -166,12 +272,22 @@ impl RuleAccum {
         self.passed += other.passed;
         self.failed += other.failed;
         self.skipped += other.skipped;
+        self.validation_skipped += other.validation_skipped;
         self.transform_errors += other.transform_errors;
         self.unmapped += other.unmapped;
-        self.pass_samples.merge(other.pass_samples);
-        self.fail_samples.merge(other.fail_samples);
+        self.pass_results.merge(other.pass_results);
+        self.fail_results.merge(other.fail_results);
         self.ambiguous_samples.merge(other.ambiguous_samples);
     }
+}
+
+/// A compiled `derive` clause with its column references remapped to positions
+/// in the extracted per-row cell vector.
+#[derive(Debug, Clone)]
+struct DerivedSlot {
+    /// How many named outputs the clause produces.
+    names: usize,
+    expr: Expr,
 }
 
 /// Column slots so the hot loop indexes a small per-row vector instead of
@@ -181,19 +297,24 @@ struct Slots {
     /// Maps a CSV column index to its position in the extracted cell vector.
     slot_of: Vec<usize>,
     id_slot: Option<usize>,
+    /// Per rule: compiled `derive` clauses, in evaluation order.
+    rule_derive: Vec<Vec<DerivedSlot>>,
 }
 
 impl Slots {
     fn build(plan: &Plan, id_idx: Option<usize>) -> Self {
         let mut needed: Vec<usize> = Vec::with_capacity(plan.rules.len() * 2 + 1);
         for rule in &plan.rules {
-            needed.extend_from_slice(rule.left.indices());
-            needed.extend_from_slice(rule.right.indices());
+            rule.left.collect_columns(&mut needed);
+            rule.right.collect_columns(&mut needed);
             if let Some(predicate) = &rule.skip {
                 predicate.collect_indices(&mut needed);
             }
             if let Some(predicate) = &rule.auto_mapping_filter {
                 predicate.collect_indices(&mut needed);
+            }
+            for derived in &rule.derive {
+                derived.expr.column_refs(&mut needed);
             }
         }
         if let Some(id) = id_idx {
@@ -209,10 +330,34 @@ impl Slots {
         }
         let id_slot = id_idx.map(|id| slot_of[id]);
 
+        // Remap each rule's `derive` expressions from input column indices to
+        // positions in the extracted `cells` vector.
+        let rule_derive = plan
+            .rules
+            .iter()
+            .map(|rule| {
+                rule.derive
+                    .iter()
+                    .map(|derived| {
+                        let mut expr = derived.expr.clone();
+                        expr.remap_refs(&mut |reference| match reference {
+                            ValueRef::Column(index) => ValueRef::Column(slot_of[index]),
+                            other => other,
+                        });
+                        DerivedSlot {
+                            names: derived.names.len(),
+                            expr,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
         Slots {
             needed,
             slot_of,
             id_slot,
+            rule_derive,
         }
     }
 
@@ -239,10 +384,73 @@ impl Slots {
 /// Compose one side of a rule into `out`. `Or` selects the first non-empty
 /// candidate column before applying the transform pipeline.
 #[allow(clippy::too_many_arguments)]
+/// Evaluate a rule's `derive` block, appending the named outputs to `derived`.
+#[inline]
+fn evaluate_derived(
+    slots: &[DerivedSlot],
+    cells: &[String],
+    separator: &Separator,
+    derived: &mut Vec<String>,
+) {
+    derived.clear();
+    if slots.is_empty() {
+        return;
+    }
+    let join = match separator {
+        Separator::Literal(literal) => literal.as_str(),
+        Separator::Regex(pattern) => pattern.as_str(),
+    };
+    for clause in slots {
+        let value = {
+            let ctx = EvalContext {
+                cells,
+                derived: derived.as_slice(),
+            };
+            expr::eval(&clause.expr, &ctx)
+        };
+
+        if clause.names > 1 {
+            if let Value::List(items) = value {
+                for index in 0..clause.names {
+                    derived.push(
+                        items
+                            .get(index)
+                            .map(|item| item.scalar_string(join))
+                            .unwrap_or_default(),
+                    );
+                }
+                continue;
+            }
+            derived.push(value.scalar_string(join));
+            for _ in 1..clause.names {
+                derived.push(String::new());
+            }
+        } else {
+            derived.push(value.scalar_string(join));
+        }
+    }
+}
+
+/// The string value of one side reference: an extracted cell or a derived
+/// output.
+#[inline]
+fn side_value<'a>(
+    reference: &ValueRef,
+    cells: &'a [String],
+    slots: &Slots,
+    derived: &'a [String],
+) -> &'a str {
+    match reference {
+        ValueRef::Column(index) => slots.cell(cells, *index),
+        ValueRef::Derived(index) => derived.get(*index).map(String::as_str).unwrap_or(""),
+    }
+}
+
 fn compose_side(
     side: &ColumnRef,
     cells: &[String],
     slots: &Slots,
+    derived: &[String],
     transforms: &[Transform],
     join: &str,
     trim: bool,
@@ -251,8 +459,10 @@ fn compose_side(
     out: &mut String,
 ) -> bool {
     match side {
-        ColumnRef::Columns(columns) => compose(
-            columns.iter().map(|&column| slots.cell(cells, column)),
+        ColumnRef::Columns(values) => compose(
+            values
+                .iter()
+                .map(|reference| side_value(reference, cells, slots, derived)),
             transforms,
             join,
             trim,
@@ -260,10 +470,10 @@ fn compose_side(
             scratch,
             out,
         ),
-        ColumnRef::Or(columns) => {
-            let chosen = columns
+        ColumnRef::Or(values) => {
+            let chosen = values
                 .iter()
-                .map(|&column| slots.cell(cells, column))
+                .map(|reference| side_value(reference, cells, slots, derived))
                 .find(|value| !(if trim { value.trim() } else { *value }).is_empty());
             match chosen {
                 Some(value) => compose(
@@ -347,6 +557,7 @@ fn build_counts_segment(
     let mut component_buf2 = String::new();
     let mut left_tokens: Vec<String> = Vec::new();
     let mut right_tokens: Vec<String> = Vec::new();
+    let mut derived: Vec<String> = Vec::new();
 
     loop {
         match reader.read_byte_record(&mut record) {
@@ -373,10 +584,13 @@ fn build_counts_segment(
                 }
             }
 
+            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
+
             compose_side(
                 &rule.left,
                 &cells,
                 slots,
+                &derived,
                 &rule.transform_left,
                 &rule.join_separator,
                 rule.trim,
@@ -388,6 +602,7 @@ fn build_counts_segment(
                 &rule.right,
                 &cells,
                 slots,
+                &derived,
                 &rule.transform_right,
                 &rule.join_separator,
                 rule.trim,
@@ -439,6 +654,7 @@ fn validate_segment(
     let mut component_buf2 = String::new();
     let mut left_tokens: Vec<String> = Vec::new();
     let mut right_tokens: Vec<String> = Vec::new();
+    let mut derived: Vec<String> = Vec::new();
 
     let mut local_row: u64 = 0;
 
@@ -462,15 +678,18 @@ fn validate_segment(
             if let Some(predicate) = &rule.skip {
                 if predicate_holds(predicate, &cells, slots, rule.trim) {
                     accum.checked += 1;
-                    accum.skipped += 1;
+                    accum.validation_skipped += 1;
                     continue;
                 }
             }
+
+            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
 
             let left_ok = compose_side(
                 &rule.left,
                 &cells,
                 slots,
+                &derived,
                 &rule.transform_left,
                 &rule.join_separator,
                 rule.trim,
@@ -482,6 +701,7 @@ fn validate_segment(
                 &rule.right,
                 &cells,
                 slots,
+                &derived,
                 &rule.transform_right,
                 &rule.join_separator,
                 rule.trim,
@@ -534,9 +754,7 @@ fn validate_segment(
                     let mut count = 0usize;
                     for token in &left_tokens {
                         match mapping.expected(token) {
-                            Some(target) => {
-                                token_slot(&mut expected_buf, count).push_str(target)
-                            }
+                            Some(target) => token_slot(&mut expected_buf, count).push_str(target),
                             None => {
                                 accum.unmapped += 1;
                                 // `\u{0}` cannot appear in a real target, so
@@ -583,25 +801,27 @@ fn validate_segment(
 
             if matched {
                 accum.passed += 1;
-                if !accum.pass_samples.is_disabled() {
-                    accum.pass_samples.offer_with(&id, || Example {
-                        id: id.clone(),
-                        row: row_number,
-                        left: left_buf.clone(),
-                        right: right_buf.clone(),
-                        expected: sample_expected(rule.pattern.as_ref(), mapping, expected),
-                    });
+                if !accum.pass_results.is_disabled() {
+                    let expected_example =
+                        sample_expected(rule.pattern.as_ref(), mapping, expected);
+                    accum.pass_results.observe(
+                        &left_buf,
+                        &right_buf,
+                        expected_example.as_deref(),
+                        &id,
+                    );
                 }
             } else {
                 accum.failed += 1;
-                if !accum.fail_samples.is_disabled() {
-                    accum.fail_samples.offer_with(&id, || Example {
-                        id: id.clone(),
-                        row: row_number,
-                        left: left_buf.clone(),
-                        right: right_buf.clone(),
-                        expected: sample_expected(rule.pattern.as_ref(), mapping, expected),
-                    });
+                if !accum.fail_results.is_disabled() {
+                    let expected_example =
+                        sample_expected(rule.pattern.as_ref(), mapping, expected);
+                    accum.fail_results.observe(
+                        &left_buf,
+                        &right_buf,
+                        expected_example.as_deref(),
+                        &id,
+                    );
                 }
             }
         }
@@ -720,7 +940,9 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
             if need_row_offsets {
                 passes += 1;
             }
-            let file_size = std::fs::metadata(&config.path).map(|m| m.len()).unwrap_or(0);
+            let file_size = std::fs::metadata(&config.path)
+                .map(|m| m.len())
+                .unwrap_or(0);
             progress.set_total(file_size * passes);
         }
     }
@@ -769,16 +991,17 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                 .collect::<Result<Vec<_>, String>>()
         })?;
 
-        let mut totals: Vec<MapCounts> = (0..auto_indices.len()).map(|_| MapCounts::new()).collect();
+        let mut totals: Vec<MapCounts> =
+            (0..auto_indices.len()).map(|_| MapCounts::new()).collect();
         for segment in per_segment {
             for (position, counts) in segment.into_iter().enumerate() {
                 mapping::merge_counts(&mut totals[position], counts);
             }
         }
         for (position, &rule_index) in auto_indices.iter().enumerate() {
-            mappings[rule_index] = Some(Arc::new(Mapping::from_counts_auto(
-                std::mem::take(&mut totals[position]),
-            )));
+            mappings[rule_index] = Some(Arc::new(Mapping::from_counts_auto(std::mem::take(
+                &mut totals[position],
+            ))));
         }
     }
 
@@ -855,10 +1078,11 @@ fn build_report(
             rows_passed: accum.passed,
             rows_failed: accum.failed,
             rows_skipped: accum.skipped,
+            rows_validation_skipped: accum.validation_skipped,
             transform_errors: accum.transform_errors,
             unmapped_values: accum.unmapped,
-            pass_examples: accum.pass_samples.payloads(),
-            fail_examples: accum.fail_samples.payloads(),
+            pass_results: accum.pass_results.top(),
+            fail_results: accum.fail_results.top(),
             mapping: mapping_report,
         });
     }
