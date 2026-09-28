@@ -150,6 +150,7 @@ fn run(cli: Cli) -> Result<bool, String> {
         threads,
         id_idx,
         progress: Some(progress),
+        collect_hits: None,
     };
 
     let report = engine::run(&plan, &config)?;

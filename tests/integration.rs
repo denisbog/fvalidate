@@ -506,3 +506,76 @@ fn strip_rows(mut report: Value) -> Value {
     }
     report
 }
+
+/// The GUI evaluates a rules file through the library and needs two things the
+/// CLI report does not expose: the column indices a rule references (for the
+/// "rule attributes only" mode) and every matching/failing row on demand (for
+/// "show all rows"). This exercises both through `EngineConfig::collect_hits`.
+#[test]
+fn engine_collects_all_hits_and_rule_columns() {
+    use fast_csv::engine::{self, EngineConfig};
+    use fast_csv::{dsl, rules};
+
+    let dir = std::env::temp_dir().join(format!("fvalidate-hits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let rules_path = dir.join("rules.vl");
+
+    std::fs::write(
+        &csv_path,
+        "id,country_name,country_code\n1,USA,US\n2,France,FR\n3,Spain,ES\n4,France,US\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rules_path,
+        "rule \"country\" {\n  left = country_name\n  right = country_code\n  mapping = auto\n}\n",
+    )
+    .unwrap();
+
+    let headers = engine::read_headers(&csv_path, b',').unwrap();
+    let program = dsl::load_file(&rules_path).unwrap();
+    let plan = rules::compile(program, &headers).unwrap();
+    let config = EngineConfig {
+        path: csv_path.clone(),
+        delimiter: b',',
+        threads: 1,
+        id_idx: Some(0),
+        progress: None,
+        collect_hits: Some(0),
+    };
+
+    let report = engine::run(&plan, &config).unwrap();
+    let rule = &report.rules[0];
+
+    // The rule reads `country_name` (1) and `country_code` (2).
+    assert_eq!(rule.rule_columns, vec![1, 2]);
+
+    // Every checked row is retained, split between pass and fail.
+    assert_eq!(rule.hits.len() as u64, rule.rows_checked);
+    let passed = rule.hits.iter().filter(|hit| hit.passed).count() as u64;
+    let failed = rule.hits.iter().filter(|hit| !hit.passed).count() as u64;
+    assert_eq!(passed, rule.rows_passed);
+    assert_eq!(failed, rule.rows_failed);
+
+    // The ids line up with the failing rows (`France` is ambiguous: FR and US).
+    let failed_ids: Vec<&str> = rule
+        .hits
+        .iter()
+        .filter(|hit| !hit.passed)
+        .map(|hit| hit.id.as_str())
+        .collect();
+    assert!(failed_ids.contains(&"4"));
+
+    // Without `collect_hits` the list stays empty (the report is bounded).
+    let plain = engine::run(
+        &plan,
+        &EngineConfig {
+            collect_hits: None,
+            ..config
+        },
+    )
+    .unwrap();
+    assert!(plain.rules[0].hits.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}

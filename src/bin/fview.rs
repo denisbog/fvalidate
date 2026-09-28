@@ -1,0 +1,4093 @@
+//! Optional iced-based GUI: grep a big CSV file and browse the matching rows.
+//!
+//! This binary is only built when the `gui` feature is enabled, so the normal
+//! `fvalidate` tool keeps compiling with no GUI dependency:
+//!
+//! ```text
+//! cargo run --release --features gui --bin fview
+//! cargo run --release --features gui --bin fview -- data.csv
+//! cargo run --release --features gui --bin fview -- data.csv -d '\t' --case-sensitive
+//! ```
+//!
+//! The file is optional: with no path the window opens on a welcome screen with
+//! an **Open CSV…** button that opens a native file picker (`rfd`).
+//!
+//! Layout:
+//! * the top bar holds the regex filter and the profile controls;
+//! * a second bar holds the attribute filter and, when attributes are hidden,
+//!   a chip per hidden attribute (click a chip to show the attribute again).
+//!   Hidden chips are sorted alphabetically so large attribute lists stay
+//!   navigable; the attribute filter narrows the hidden list to the matching
+//!   names (and highlights the matching chips in the main view);
+//! * every matching row is rendered as a set of `attribute = value` chips, each
+//!   with a mute icon that hides that attribute from all rows and moves its name
+//!   into the top bar.
+//!
+//! Scanning: the filter is **debounced** (a scan starts ~180 ms after the last
+//! keystroke, and an unchanged pattern is never re-scanned). The file is
+//! memory-mapped read-only. Two opt-in checkboxes in the top bar change the
+//! scan: **visible only** searches just the attributes that are currently
+//! shown, and **parallel** reads the whole file in record-aligned segments
+//! across all cores, which yields exact row/match totals but never exits early.
+//!
+//! Display and indexing: a **table** checkbox renders the matches as a table of
+//! the visible attributes instead of chips. Each chip, and each table header,
+//! carries a database button that builds (or drops) a per-column prefix
+//! **index** and a mute button that hides the attribute; indexed attributes are
+//! highlighted (green background, filled icon) in both views. While an index
+//! exists and the **index** checkbox is on, a non-empty filter becomes a
+//! case-insensitive `beginsWith` prefix query over the indexed columns — served
+//! straight from the index, with exact totals and no file scan. Unchecking
+//! **index** (or using `--case-sensitive`) falls back to the regex. Chips show
+//! only the cell value by default; the **attribute names** checkbox brings back
+//! the `attribute = value` label. Clicking a chip copies its value (a tooltip
+//! reveals values clipped by the two-line limit, and a double click opens the
+//! row form), and clicking a table row — or the empty part of a chip row —
+//! opens the form directly. The form closes
+//! with its button, the Escape key, or a click on the backdrop. Escape also
+//! clears the regex or attribute filter the user was last editing.
+//!
+//! Profiles: the set of currently visible attributes can be saved under a name
+//! and re-applied later. Profiles are persisted as TOML in the platform config
+//! directory (`<config>/fview/profiles.toml`).
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use clap::{Parser, ValueEnum};
+use fast_csv::dsl;
+use fast_csv::engine::{self, EngineConfig};
+use fast_csv::report::{Report, RowHit, RuleReport};
+use fast_csv::rules::{self, ColumnResolver};
+use iced::keyboard::{self, Key};
+use iced::widget::scrollable::AbsoluteOffset;
+use iced::widget::text::Wrapping;
+use iced::widget::{
+    button, checkbox, column, container, horizontal_rule, mouse_area, opaque, pick_list, row,
+    scrollable, stack, text, text_input, tooltip, Row, Space,
+};
+use iced::theme::Palette;
+use iced::{
+    Background, Border, Center, Color, Element, Fill, Length, Padding, Shadow, Subscription, Task,
+    Theme, Vector,
+};
+use iced_fonts::{Bootstrap, BOOTSTRAP_FONT, BOOTSTRAP_FONT_BYTES};
+use memmap2::Mmap;
+use rayon::prelude::*;
+use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
+use simd_csv::ByteRecord;
+
+const BUFFER_CAPACITY: usize = 64 * 1024;
+/// How often the debounce timer is polled while a filter edit is pending.
+const DEBOUNCE_TICK_MS: u64 = 50;
+/// Quiet period after the last filter keystroke before a scan is started.
+const DEBOUNCE_QUIET_MS: u64 = 180;
+/// Fixed height of one table row in the table view.
+const TABLE_ROW_HEIGHT: f32 = 24.0;
+/// Minimum width of a table column. The table grows horizontally instead of
+/// squeezing columns below this.
+const TABLE_CELL_MIN_WIDTH: f32 = 160.0;
+/// Spacing between chips, in px.
+const CHIP_SPACING: f32 = 8.0;
+/// Non-text width of a chip: padding + index icon + mute icon + inner spacing.
+const CHIP_CHROME: f32 = 66.0;
+/// Non-text height of a chip: vertical padding + border.
+const CHIP_CHROME_V: f32 = 8.0;
+/// Height of a single line of chip text.
+const CHIP_LINE_HEIGHT: f32 = 16.0;
+/// A chip may wrap to at most this many lines; longer values are clipped.
+/// Capping the height is what lets every data stripe have a fixed height, which
+/// in turn makes the virtual scrolling below exact.
+const MAX_CHIP_LINES: usize = 2;
+/// Vertical padding of a data stripe (kept in sync with `container.padding`).
+const STRIPE_PADDING: f32 = 8.0;
+/// Spacing between the chip lines inside a stripe.
+const CHIP_LINE_SPACING: f32 = 6.0;
+/// Rows rendered above and below the viewport so scrolling does not flash gaps.
+const OVERSCAN_ROWS: usize = 3;
+/// Preferred chip width used to decide how many chips fit on a line before any
+/// rows are known.
+const DEFAULT_CHIP_WIDTH: f32 = 220.0;
+/// Rough width of one character at size 13, used to decide text wrapping.
+const CHAR_WIDTH: f32 = 7.2;
+/// Corner radius shared by cards, inputs and buttons.
+const RADIUS: f32 = 4.0;
+/// Corner radius of the large floating panels.
+const CARD_RADIUS: f32 = 6.0;
+/// Height reserved for the status line. Fixed so the different states (plain
+/// text, the taller icon + "scanning…" row) do not nudge the rows below it.
+const STATUS_HEIGHT: f32 = 22.0;
+/// Row-count choices offered by the "rows" drop-down. The largest is bounded so
+/// the grid never tries to hold an unbounded list.
+const ROW_LIMIT_CHOICES: [usize; 6] = [100, 250, 500, 1000, 5000, 10000];
+
+#[derive(Parser, Debug, Clone)]
+#[command(name = "fview", about = "Grep and browse rows of a big CSV file (GUI)")]
+struct Args {
+    /// CSV file to view. Optional: without it, use the Open button.
+    path: Option<PathBuf>,
+
+    /// Field delimiter (single byte; use '\t' for a tab).
+    #[arg(short = 'd', long, default_value = ",")]
+    delimiter: String,
+
+    /// Make the filter regex case-sensitive (case-insensitive by default).
+    #[arg(short = 's', long, default_value_t = false)]
+    case_sensitive: bool,
+
+    /// Maximum number of matching rows to display (default 100).
+    #[arg(short = 'n', long, default_value_t = 100)]
+    limit: usize,
+
+    /// Rendering backend. `auto` prefers the GPU (wgpu) and falls back to the
+    /// CPU renderer (tiny-skia) when no GPU is available; the other values
+    /// force a specific backend.
+    #[arg(long, value_enum, default_value_t = Backend::Auto)]
+    backend: Backend,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// Prefer the GPU, fall back to the CPU renderer.
+    Auto,
+    /// Force the wgpu (GPU) renderer.
+    Wgpu,
+    /// Force the tiny-skia (CPU) renderer.
+    TinySkia,
+}
+
+#[derive(Debug, Clone)]
+struct ScanResult {
+    rows: Vec<Vec<String>>,
+    /// Best known number of matching data rows. Exact after a full (parallel)
+    /// scan; after an early-exiting sequential scan this is the number of kept
+    /// rows, since the true total was never read.
+    matched: usize,
+    truncated: bool,
+    /// Number of data rows actually read from the file. When `truncated` is
+    /// false this is the total number of rows in the file.
+    rows_read: usize,
+    /// True when the matches came from a built index (prefix search) rather
+    /// than a file scan.
+    indexed: bool,
+}
+
+impl ScanResult {
+    fn empty() -> Self {
+        ScanResult {
+            rows: Vec::new(),
+            matched: 0,
+            truncated: false,
+            rows_read: 0,
+            indexed: false,
+        }
+    }
+}
+
+/// State of the rule-evaluation panel: which rule file is loaded, the evaluated
+/// report (if any) and the on-demand full row list for one rule.
+#[derive(Debug, Default)]
+struct RulesState {
+    /// Rules DSL file chosen by the user.
+    path: Option<PathBuf>,
+    /// Column holding the row id used by the report; empty means row numbers.
+    id_column: String,
+    /// Result of the last evaluation, kept in memory for the panel.
+    report: Option<Report>,
+    error: Option<String>,
+    evaluating: bool,
+    /// Complete match/fail list of one rule, with the full CSV row for each
+    /// hit. It feeds the main grid when a rule filter is active.
+    hits: Option<RuleHits>,
+    /// Which side of `hits` the grid shows: `None` = every row, `Some(true)` =
+    /// only matching rows, `Some(false)` = only failing rows.
+    hits_filter: Option<bool>,
+    /// Whether the main grid currently shows rule rows (rather than scan
+    /// results).
+    view_active: bool,
+    /// Rule whose rows are being collected for the grid.
+    pending_rule: Option<usize>,
+    collecting: bool,
+    /// Restrict the main grid (and the detail form) to the attributes the
+    /// active rule references.
+    attrs_only: bool,
+    /// The user's hidden-attribute set before `attrs_only` narrowed the grid, so
+    /// it can be restored when the mode or the rule view ends.
+    saved_muted: Option<HashSet<usize>>,
+    /// Bumped on every evaluation so stale background results are dropped.
+    generation: u64,
+}
+
+/// Every matching and failing row of one rule, together with the full CSV row
+/// for each hit (in `hits` order) so the main grid can render the attributes.
+#[derive(Debug, Clone)]
+struct RuleHits {
+    rule: usize,
+    hits: Vec<RowHit>,
+    rows: Vec<Vec<String>>,
+}
+
+/// The row opened in the floating detail form.
+#[derive(Debug, Clone)]
+struct DetailState {
+    /// Title shown in the form header.
+    title: String,
+    /// `(attribute, value)` pairs, in column order.
+    fields: Vec<(String, String)>,
+    /// Rule the row came from, when opened from the rules panel. Enables the
+    /// "rule attributes only" mode.
+    rule: Option<usize>,
+}
+
+/// A prefix index for one column: one `(lowercased value, row byte offset)`
+/// entry per data row, sorted by value. A `beginsWith` search is then a binary
+/// search followed by a forward scan while the prefix still matches.
+#[derive(Debug, Clone)]
+struct ColumnIndex {
+    entries: Vec<(String, u64)>,
+}
+
+impl ColumnIndex {
+    /// Byte offsets of the rows whose value starts with `prefix`, in file order.
+    /// Matching is case-insensitive (keys are stored lowercased).
+    fn prefix_offsets(&self, prefix: &str) -> Vec<u64> {
+        let prefix = prefix.to_lowercase();
+        let start = self
+            .entries
+            .partition_point(|(value, _)| value.as_str() < prefix.as_str());
+        let mut offsets = Vec::new();
+        for (value, offset) in &self.entries[start..] {
+            if !value.starts_with(&prefix) {
+                break;
+            }
+            offsets.push(*offset);
+        }
+        // Keys are sorted by value, not by position, so restore file order.
+        offsets.sort_unstable();
+        offsets
+    }
+}
+
+/// A named set of visible attributes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ProfileConfig {
+    #[serde(default)]
+    visible: Vec<String>,
+}
+
+/// The whole persisted configuration file (`<config>/fview/profiles.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Config {
+    #[serde(default)]
+    profiles: BTreeMap<String, ProfileConfig>,
+}
+
+/// Resolve the path of the TOML profile store.
+fn config_path() -> Option<PathBuf> {
+    dirs::config_dir().map(|dir| dir.join("fview").join("profiles.toml"))
+}
+
+/// Load the profile store, falling back to an empty set on any I/O or parse
+/// error (a broken config should never stop the viewer from opening).
+fn load_config() -> Config {
+    let Some(path) = config_path() else {
+        return Config::default();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Config::default();
+    };
+    toml::from_str(&text).unwrap_or_default()
+}
+
+/// Persist the profile store as pretty TOML, creating the directory if needed.
+fn store_config(config: &Config) -> Result<(), String> {
+    let Some(path) = config_path() else {
+        return Err("cannot determine a config directory".into());
+    };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
+    let text =
+        toml::to_string_pretty(config).map_err(|e| format!("cannot serialize profiles: {e}"))?;
+    std::fs::write(&path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))
+}
+
+/// Case-insensitive substring test used by the attribute filter. An empty
+/// filter never matches (used for highlighting) and never hides (used for the
+/// hidden list), so callers handle the empty case explicitly where needed.
+fn attr_matches(filter: &str, name: &str) -> bool {
+    let filter = filter.trim();
+    !filter.is_empty() && name.to_lowercase().contains(&filter.to_lowercase())
+}
+
+/// Note shown when the hidden-attribute list is collapsed, so the count stays
+/// visible without spending vertical space on the chips.
+fn hidden_note(count: usize) -> String {
+    match count {
+        1 => "1 hidden attribute available — use the Hidden button to reveal it".to_string(),
+        _ => format!(
+            "{count} hidden attributes available — use the Hidden button to reveal them"
+        ),
+    }
+}
+
+/// Status line for the current scan. `rows_read` is the number of data rows
+/// read; when the scan was not truncated it is the total number of rows in the
+/// file. `elapsed` appends how long the search itself took.
+fn status_text(
+    shown: usize,
+    matched: usize,
+    rows_read: usize,
+    truncated: bool,
+    indexed: bool,
+    elapsed: Option<Duration>,
+) -> String {
+    let summary = if indexed {
+        if truncated {
+            format!("showing first {shown} of {matched} matching rows (index prefix)")
+        } else {
+            format!("{matched} matching rows (index prefix)")
+        }
+    } else if truncated {
+        if matched > shown {
+            format!("showing first {shown} of {matched} matching rows · {rows_read} rows read")
+        } else {
+            format!("showing first {shown} matching rows (more available) · {rows_read} rows read")
+        }
+    } else if matched == rows_read {
+        format!("{rows_read} rows")
+    } else {
+        format!("{matched} matching rows of {rows_read} total")
+    };
+
+    match elapsed {
+        Some(elapsed) => format!("{summary} · {}", format_duration(elapsed)),
+        None => summary,
+    }
+}
+
+/// Compact duration for the status line: milliseconds below one second, seconds
+/// with two decimals above.
+fn format_duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs_f64();
+    if seconds < 1.0 {
+        format!("{} ms", elapsed.as_millis())
+    } else {
+        format!("{seconds:.2} s")
+    }
+}
+
+/// Layout geometry derived from the window width and the width of a typical
+/// chip: chips per line, the maximum chip width, and how many hidden-attribute
+/// chips fit on a line.
+fn chip_layout(width: f32, chip_width: f32) -> (usize, f32, usize) {
+    let available = (width - 28.0).max(200.0);
+    let chip_width = chip_width.max(120.0);
+    let columns = (((available + CHIP_SPACING) / (chip_width + CHIP_SPACING)).floor() as usize)
+        .max(1)
+        .min(available as usize / 60);
+    let chip_max = ((available - (columns.saturating_sub(1) as f32) * CHIP_SPACING)
+        / columns as f32)
+        .max(120.0);
+    let hidden_columns = ((available / 210.0).floor() as usize).max(1);
+    (columns, chip_max, hidden_columns)
+}
+
+/// Estimated width of the widest chip in the current window, used to decide how
+/// many chips fit on a line. Using the widest label keeps chips from wrapping
+/// earlier than necessary while still filling the row. Only the first rows are
+/// sampled so a large result set does not slow the view down.
+fn typical_chip_width(
+    rows: &[Vec<String>],
+    visible_columns: &[usize],
+    headers: &[String],
+    show_names: bool,
+) -> f32 {
+    const SAMPLE_ROWS: usize = 16;
+    let header_chars = |column: usize| {
+        headers.get(column).map(String::as_str).unwrap_or("").chars().count()
+    };
+    let mut widest: f32 = 0.0;
+    for row in rows.iter().take(SAMPLE_ROWS) {
+        for &column in visible_columns {
+            let value_chars = row.get(column).map(String::as_str).unwrap_or("").chars().count();
+            let chars = if show_names {
+                header_chars(column) + 3 + value_chars
+            } else {
+                value_chars
+            };
+            widest = widest.max(chars as f32 * CHAR_WIDTH + CHIP_CHROME);
+        }
+    }
+    if show_names {
+        // A header alone must not be clipped either.
+        for &column in visible_columns {
+            widest = widest.max(header_chars(column) as f32 * CHAR_WIDTH + CHIP_CHROME);
+        }
+    }
+    // Before any rows are known, fall back to a sensible average chip.
+    if widest > 0.0 {
+        widest
+    } else {
+        DEFAULT_CHIP_WIDTH
+    }
+}
+
+/// Height reserved for one line of chips, tall enough for the maximum number
+/// of wrapped lines a chip may show.
+fn chip_line_box() -> f32 {
+    MAX_CHIP_LINES as f32 * CHIP_LINE_HEIGHT + CHIP_CHROME_V
+}
+
+/// Fixed height of a data stripe showing `lines` lines of chips. Used both to
+/// place rows and to give each stripe exactly that height, keeping virtual
+/// scrolling stable.
+fn stripe_height(lines: usize) -> f32 {
+    let lines = lines.max(1);
+    lines as f32 * chip_line_box()
+        + (lines - 1) as f32 * CHIP_LINE_SPACING
+        + 2.0 * STRIPE_PADDING
+}
+
+/// Filter box the user last typed in, so Escape clears the expected one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilterFocus {
+    Results,
+    Attributes,
+}
+
+#[derive(Debug, Clone)]
+enum Message {
+    OpenFile,
+    FileChosen(Option<PathBuf>),
+    FilterChanged(String),
+    RunFilter,
+    /// Fired by the debounce timer; starts a scan once typing has paused.
+    DebounceTick,
+    /// Search only the attributes that are currently visible.
+    ToggleVisibleOnly(bool),
+    /// Use the parallel, full-file scan instead of the sequential early-exit one.
+    ToggleParallel(bool),
+    /// Render the matches as a table of the visible attributes instead of chips.
+    ToggleTable(bool),
+    /// Use the built column indexes (prefix search) instead of the regex.
+    ToggleUseIndex(bool),
+    /// Maximum number of matching rows to display; changing it re-runs the scan.
+    LimitSelected(usize),
+    /// Build or drop the prefix index for an attribute.
+    ToggleIndex(usize),
+    /// Open the detail form for a matching row (index into `rows`).
+    RowClicked(usize),
+    /// A chip was clicked (row, column): copies its value and opens the detail
+    /// form when the click is part of a double click.
+    ChipClicked(usize, usize),
+    /// Show the attribute name in chip labels instead of the value alone.
+    ToggleAttributeNames(bool),
+    /// Close the row detail form.
+    CloseDetail,
+    /// Escape: close the row form, or clear the filter box being edited.
+    Escape,
+    /// Copy an attribute value from the detail form: `(attribute, value)`.
+    CopyValue(String, String),
+    /// Hide an attribute (column index) from the rows.
+    Mute(usize),
+    /// Show a previously hidden attribute again.
+    Unmute(usize),
+    UnmuteAll,
+    /// Hide every attribute at once, so a few can be picked back.
+    MuteAll,
+    /// Expand or collapse the list of hidden attribute chips.
+    ToggleHidden,
+    /// The attribute search box changed: highlight matching chips and narrow
+    /// the hidden attribute list.
+    AttributeFilterChanged(String),
+    /// A saved profile was picked from the dropdown.
+    ProfileSelected(String),
+    /// Clear the selected profile (attributes stay as they are).
+    ClearProfile,
+    /// Overwrite the selected profile with the current visible attributes.
+    SaveCurrentProfile,
+    /// Open the "save as new profile" name prompt.
+    BeginSaveNewProfile,
+    NewProfileNameChanged(String),
+    ConfirmSaveNewProfile,
+    CancelSaveNewProfile,
+    /// `(generation, result)`; stale generations are ignored.
+    ScanFinished(u64, Result<ScanResult, String>),
+    /// Show or hide the rule-evaluation panel.
+    ToggleRulesPanel,
+    /// Open a native picker for the rules DSL file.
+    OpenRules,
+    RulesChosen(Option<PathBuf>),
+    /// The id-column name used when evaluating the rules changed.
+    RulesIdColumnChanged(String),
+    /// Evaluate the selected rules against the open CSV.
+    EvaluateRules,
+    /// `(generation, result)`; stale generations are ignored.
+    RulesEvaluated(u64, Result<Report, String>),
+    /// Collect the complete pass/fail row list for one rule (click on a rule).
+    RuleAllRows(usize),
+    /// Show only one side of a rule's rows: `(rule, passed)`.
+    RuleFilterRows(usize, bool),
+    /// `(generation, rule, result)`; stale generations are ignored.
+    RuleRowsCollected(u64, usize, Result<RuleHits, String>),
+    /// Stop filtering the main grid and return to the regular scan results.
+    ClearRuleView,
+    /// Show only the attributes referenced by the row's rule.
+    ToggleRuleAttrsOnly(bool),
+    /// `(column, path, result)`; a background column-index build finished. The
+    /// path is carried so a build that outlives a file switch is discarded.
+    IndexBuilt(usize, PathBuf, Result<ColumnIndex, String>),
+    /// The window was resized; used to wrap chips and to size the virtual list.
+    Resized(f32, f32),
+    /// The scroll position changed; drives the virtual row window.
+    Scrolled(scrollable::Viewport),
+}
+
+struct Viewer {
+    path: Option<PathBuf>,
+    delimiter: u8,
+    case_sensitive: bool,
+    limit: usize,
+    headers: Vec<String>,
+    muted: HashSet<usize>,
+    /// Whether the list of hidden attribute chips in the top bar is expanded.
+    show_hidden: bool,
+    filter: String,
+    rows: Vec<Vec<String>>,
+    /// The row opened in the floating detail form.
+    detail: Option<DetailState>,
+    /// Attribute whose value was last copied from the detail form, so the form
+    /// can confirm the copy.
+    copy_notice: Option<String>,
+    /// Whether the rule-evaluation panel is open.
+    show_rules: bool,
+    /// Rule set + evaluation state for the panel.
+    rules: RulesState,
+    /// Render `attribute = value` chip labels; off by default so a chip shows
+    /// just the value.
+    show_attr_names: bool,
+    /// Filter box the user last typed in, so Escape clears that one first.
+    filter_focus: Option<FilterFocus>,
+    /// Last chip click `(when, row, column)`, used to detect a double click.
+    last_chip_click: Option<(Instant, usize, usize)>,
+    truncated: bool,
+    /// Best known total number of matching rows from the last scan.
+    matched: usize,
+    /// Number of data rows read by the last completed scan.
+    rows_read: usize,
+    error: Option<String>,
+    scanning: bool,
+    /// When the in-flight scan started, used to time the search.
+    scan_started: Option<Instant>,
+    /// Duration of the last completed scan, shown in the status line.
+    scan_duration: Option<Duration>,
+    dirty: bool,
+    /// Filter text used when the last scan was started, so a redundant rescan
+    /// of an unchanged pattern is skipped.
+    last_scanned: Option<String>,
+    /// Whether a filter edit is waiting out the debounce quiet period.
+    debounce_pending: bool,
+    /// Time of the last filter keystroke, used by the debounce timer.
+    last_edit: Option<Instant>,
+    /// Search only the currently visible attributes (skips hidden ones).
+    visible_only: bool,
+    /// Use the parallel full-file scan instead of the sequential early-exit one.
+    parallel: bool,
+    /// Render the matches as a table of the visible attributes instead of chips.
+    table: bool,
+    /// Use the built column indexes (prefix search) instead of the regex.
+    use_index: bool,
+    /// Built prefix indexes, keyed by column index.
+    indexes: HashMap<usize, Arc<ColumnIndex>>,
+    /// Whether a column-index build is currently running.
+    indexing: bool,
+    /// Feedback about index actions, shown in the controls bar.
+    index_status: Option<String>,
+    /// Whether the last completed scan used an index (drives the status line).
+    indexed_result: bool,
+    generation: u64,
+    window_width: f32,
+    /// Stable id of the row scrollable, so the view can jump back to the top.
+    scroll_id: scrollable::Id,
+    /// Vertical scroll offset of the row list, in px.
+    scroll_offset: f32,
+    /// Height of the row viewport, in px.
+    viewport_height: f32,
+    /// Attribute search: highlights matching chips in the main view and narrows
+    /// the hidden attribute list to the matching names.
+    attribute_filter: String,
+    /// Saved profiles, keyed by name.
+    profiles: BTreeMap<String, ProfileConfig>,
+    /// Profile currently applied, if any.
+    current_profile: Option<String>,
+    /// Whether the "save as new profile" name prompt is open.
+    naming_profile: bool,
+    new_profile_name: String,
+    /// Short feedback message about profile actions (shown next to the controls).
+    profile_status: Option<String>,
+}
+
+impl Viewer {
+    fn new(args: Args) -> (Self, Task<Message>) {
+        let delimiter = parse_delimiter(&args.delimiter).unwrap_or(b',');
+
+        let mut viewer = Viewer {
+            path: None,
+            delimiter,
+            case_sensitive: args.case_sensitive,
+            limit: args.limit.max(1),
+            headers: Vec::new(),
+            muted: HashSet::new(),
+            show_hidden: false,
+            filter: String::new(),
+            rows: Vec::new(),
+            detail: None,
+            copy_notice: None,
+            show_rules: false,
+            rules: RulesState::default(),
+            show_attr_names: false,
+            filter_focus: None,
+            last_chip_click: None,
+            truncated: false,
+            matched: 0,
+            rows_read: 0,
+            error: None,
+            scanning: false,
+            scan_started: None,
+            scan_duration: None,
+            dirty: false,
+            last_scanned: None,
+            debounce_pending: false,
+            last_edit: None,
+            visible_only: false,
+            parallel: false,
+            table: false,
+            use_index: true,
+            indexes: HashMap::new(),
+            indexing: false,
+            index_status: None,
+            indexed_result: false,
+            generation: 0,
+            window_width: 1200.0,
+            scroll_id: scrollable::Id::unique(),
+            scroll_offset: 0.0,
+            viewport_height: 720.0,
+            attribute_filter: String::new(),
+            profiles: load_config().profiles,
+            current_profile: None,
+            naming_profile: false,
+            new_profile_name: String::new(),
+            profile_status: None,
+        };
+
+        let task = match args.path {
+            Some(path) => viewer.load_file(path),
+            None => Task::none(),
+        };
+
+        (viewer, task)
+    }
+
+    /// Open a native file picker on a background task.
+    fn pick_file() -> Task<Message> {
+        Task::perform(
+            async {
+                rfd::AsyncFileDialog::new()
+                    .add_filter("CSV / TSV", &["csv", "tsv", "txt"])
+                    .pick_file()
+                    .await
+                    .map(|handle| handle.path().to_path_buf())
+            },
+            Message::FileChosen,
+        )
+    }
+
+    /// Switch to a new file: reset the per-file state, read its headers and
+    /// start scanning. Any in-flight scan is invalidated by the generation bump.
+    fn load_file(&mut self, path: PathBuf) -> Task<Message> {
+        self.generation += 1;
+        self.scanning = false;
+        self.scan_started = None;
+        self.scan_duration = None;
+        self.dirty = false;
+        self.rows.clear();
+        self.detail = None;
+        self.copy_notice = None;
+        // The evaluated report belonged to the previous file; drop it (but keep
+        // the chosen rules file and id column for a quick re-evaluation).
+        self.rules.generation += 1;
+        self.rules.report = None;
+        self.rules.hits = None;
+        self.rules.hits_filter = None;
+        self.rules.view_active = false;
+        self.rules.pending_rule = None;
+        self.rules.evaluating = false;
+        self.rules.collecting = false;
+        self.rules.saved_muted = None;
+        self.rules.error = None;
+        self.last_chip_click = None;
+        self.filter_focus = None;
+        self.truncated = false;
+        self.matched = 0;
+        self.rows_read = 0;
+        self.last_scanned = None;
+        self.debounce_pending = false;
+        self.last_edit = None;
+        self.indexes.clear();
+        self.indexing = false;
+        self.index_status = None;
+        self.indexed_result = false;
+        self.muted.clear();
+        self.show_hidden = false;
+        self.error = None;
+        self.current_profile = None;
+        self.naming_profile = false;
+        self.new_profile_name.clear();
+        self.profile_status = None;
+        self.path = Some(path.clone());
+
+        match read_headers(&path, self.delimiter) {
+            Ok(headers) => {
+                self.headers = headers;
+                self.start_scan()
+            }
+            Err(message) => {
+                self.headers.clear();
+                self.error = Some(message);
+                Task::none()
+            }
+        }
+    }
+
+    /// Names of the attributes currently visible (the active set).
+    fn visible_names(&self) -> Vec<String> {
+        self.headers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !self.muted.contains(index))
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
+
+    /// Apply a saved profile: attributes listed in it become visible, every
+    /// other attribute is treated as hidden.
+    fn apply_profile(&mut self, name: &str) {
+        let Some(profile) = self.profiles.get(name).cloned() else {
+            self.profile_status = Some(format!("unknown profile “{name}”"));
+            return;
+        };
+        let visible: HashSet<&str> = profile.visible.iter().map(String::as_str).collect();
+        self.muted = self
+            .headers
+            .iter()
+            .enumerate()
+            .filter(|(_, header)| !visible.contains(header.as_str()))
+            .map(|(index, _)| index)
+            .collect();
+        self.current_profile = Some(name.to_string());
+        self.profile_status = Some(format!("applied “{name}”"));
+    }
+
+    /// Persist the current profile set to the TOML store.
+    fn persist(&self) -> Result<(), String> {
+        store_config(&Config {
+            profiles: self.profiles.clone(),
+        })
+    }
+
+    /// Overwrite the profile that is currently selected with the attributes
+    /// that are visible right now.
+    fn save_current_profile(&mut self) {
+        let Some(name) = self.current_profile.clone() else {
+            return;
+        };
+        let visible = self.visible_names();
+        self.profiles.insert(name.clone(), ProfileConfig { visible });
+        match self.persist() {
+            Ok(()) => self.profile_status = Some(format!("saved “{name}”")),
+            Err(message) => self.profile_status = Some(message),
+        }
+    }
+
+    /// Save the visible attributes under the name typed in the prompt.
+    fn save_new_profile(&mut self) {
+        let name = self.new_profile_name.trim().to_string();
+        if name.is_empty() {
+            self.profile_status = Some("enter a profile name".into());
+            return;
+        }
+        let visible = self.visible_names();
+        self.profiles.insert(name.clone(), ProfileConfig { visible });
+        match self.persist() {
+            Ok(()) => {
+                self.current_profile = Some(name.clone());
+                self.naming_profile = false;
+                self.new_profile_name.clear();
+                self.profile_status = Some(format!("saved “{name}”"));
+            }
+            Err(message) => self.profile_status = Some(message),
+        }
+    }
+
+    /// Kick off a background scan. If one is already running we just mark the
+    /// state dirty, which coalesces bursts of typing into a single re-scan.
+    fn start_scan(&mut self) -> Task<Message> {
+        let Some(path) = self.path.clone() else {
+            return Task::none();
+        };
+        // A fresh search always leaves the rule-filtered grid.
+        self.rules.view_active = false;
+        self.rules.pending_rule = None;
+        self.rules.collecting = false;
+        self.sync_rule_attrs();
+        if self.scanning {
+            self.dirty = true;
+            return Task::none();
+        }
+
+        self.error = None;
+        self.scanning = true;
+        self.scan_started = Some(Instant::now());
+        self.dirty = false;
+        self.generation += 1;
+        let generation = self.generation;
+        let delimiter = self.delimiter;
+        let pattern = self.filter.clone();
+        let case_sensitive = self.case_sensitive;
+        let limit = self.limit;
+        let parallel = self.parallel;
+        // When enabled, only the columns that are currently visible are
+        // searched; hidden attributes are skipped entirely.
+        let visible = if self.visible_only {
+            Some(
+                (0..self.headers.len())
+                    .map(|index| !self.muted.contains(&index))
+                    .collect::<Vec<bool>>(),
+            )
+        } else {
+            None
+        };
+        // A built index turns the search into a case-insensitive `beginsWith`
+        // prefix query over the indexed columns. `--case-sensitive` and an empty
+        // pattern keep the regex path.
+        let indexes: Vec<Arc<ColumnIndex>> = self
+            .indexes
+            .iter()
+            .filter(|(column, _)| !self.visible_only || !self.muted.contains(column))
+            .map(|(_, index)| Arc::clone(index))
+            .collect();
+        let index_mode = self.index_mode() && !self.filter.trim().is_empty();
+        self.last_scanned = Some(pattern.clone());
+
+        if index_mode {
+            Task::perform(
+                async move { scan_indexed(path, delimiter, pattern, indexes, limit) },
+                move |result| Message::ScanFinished(generation, result),
+            )
+        } else {
+            Task::perform(
+                async move {
+                    scan(
+                        path,
+                        delimiter,
+                        pattern,
+                        case_sensitive,
+                        limit,
+                        visible,
+                        parallel,
+                    )
+                },
+                move |result| Message::ScanFinished(generation, result),
+            )
+        }
+    }
+
+    /// Kick off a background evaluation of the selected rules file against the
+    /// open CSV. The report (with its sample ids) fills the rules panel.
+    fn start_rules_evaluation(&mut self) -> Task<Message> {
+        let Some(csv) = self.path.clone() else {
+            self.rules.error = Some("open a CSV file first".into());
+            return Task::none();
+        };
+        let Some(rules_path) = self.rules.path.clone() else {
+            self.rules.error = Some("select a rules file first".into());
+            return Task::none();
+        };
+        let restore_grid = self.rules.view_active;
+        self.rules.evaluating = true;
+        self.rules.error = None;
+        self.rules.hits = None;
+        self.rules.hits_filter = None;
+        self.rules.view_active = false;
+        self.rules.pending_rule = None;
+        self.rules.collecting = false;
+        self.sync_rule_attrs();
+        self.rules.generation += 1;
+        let generation = self.rules.generation;
+        let delimiter = self.delimiter;
+        let id_column = self.rules.id_column.clone();
+        let eval = Task::perform(
+            async move { evaluate_rules(csv, delimiter, rules_path, id_column, None) },
+            move |result| Message::RulesEvaluated(generation, result),
+        );
+        if restore_grid {
+            Task::batch([eval, self.start_scan()])
+        } else {
+            eval
+        }
+    }
+
+    /// The rule whose rows currently fill the main grid, if any.
+    fn active_rule(&self) -> Option<usize> {
+        if self.rules.view_active {
+            self.rules.hits.as_ref().map(|hits| hits.rule)
+        } else {
+            None
+        }
+    }
+
+    /// Redirect the main grid to a rule's rows. `filter` selects the side to
+    /// show. Clicking the same view again clears it and returns the grid to the
+    /// regular scan results.
+    fn show_rule_rows(&mut self, rule: usize, filter: Option<bool>) -> Task<Message> {
+        // Toggling the exact view off restores the scan results.
+        if self.rules.view_active
+            && self.rules.hits.as_ref().map(|hits| hits.rule) == Some(rule)
+            && self.rules.hits_filter == filter
+        {
+            return self.clear_rule_view();
+        }
+        // Showing rule rows takes over the grid, so abandon any running scan.
+        self.cancel_scan();
+        // Data already collected: just switch side / re-activate.
+        if self.rules.hits.as_ref().map(|hits| hits.rule) == Some(rule) {
+            self.rules.hits_filter = filter;
+            self.rules.view_active = true;
+            return self.apply_rule_view();
+        }
+        let (Some(csv), Some(rules_path)) = (self.path.clone(), self.rules.path.clone()) else {
+            return Task::none();
+        };
+        // Collect the rule's rows and their full CSV records in one background
+        // pass, then let the response fill the grid.
+        self.rules.collecting = true;
+        self.rules.pending_rule = Some(rule);
+        self.rules.hits = None;
+        self.rules.hits_filter = filter;
+        self.rules.generation += 1;
+        let generation = self.rules.generation;
+        let delimiter = self.delimiter;
+        let id_column = self.rules.id_column.clone();
+        Task::perform(
+            async move { load_rule_rows(csv, delimiter, rules_path, id_column, rule) },
+            move |result| Message::RuleRowsCollected(generation, rule, result),
+        )
+    }
+
+    /// Abandon an in-flight scan so its result cannot overwrite the grid once
+    /// rule rows are shown.
+    fn cancel_scan(&mut self) {
+        self.generation += 1;
+        self.scanning = false;
+        self.scan_started = None;
+        self.dirty = false;
+    }
+
+    /// Stop showing rule rows in the grid and re-run the normal scan.
+    fn clear_rule_view(&mut self) -> Task<Message> {
+        self.rules.view_active = false;
+        self.rules.collecting = false;
+        self.rules.pending_rule = None;
+        self.sync_rule_attrs();
+        // Invalidate a collection that may still be running.
+        self.rules.generation += 1;
+        self.start_scan()
+    }
+
+    /// Apply (or lift) the "rule attributes only" restriction over the grid's
+    /// hidden-attribute set. While the mode is on and a rule is shown, every
+    /// column the rule does not read is hidden; the user's previous set is
+    /// restored when the mode or the rule view ends.
+    fn sync_rule_attrs(&mut self) {
+        if self.rules.attrs_only {
+            if let Some(rule) = self.active_rule() {
+                if self.rules.saved_muted.is_none() {
+                    self.rules.saved_muted = Some(self.muted.clone());
+                }
+                let keep: HashSet<usize> = self.rule_columns(rule).iter().copied().collect();
+                self.muted = (0..self.headers.len())
+                    .filter(|column| !keep.contains(column))
+                    .collect();
+                return;
+            }
+        }
+        if let Some(saved) = self.rules.saved_muted.take() {
+            self.muted = saved;
+        }
+    }
+
+    /// Fill the main grid with the currently selected side of the collected
+    /// rule rows.
+    fn apply_rule_view(&mut self) -> Task<Message> {
+        let (rows, total) = {
+            let Some(hits) = &self.rules.hits else {
+                return Task::none();
+            };
+            let filter = self.rules.hits_filter;
+            let mut rows = Vec::new();
+            for (hit, row) in hits.hits.iter().zip(hits.rows.iter()) {
+                let keep = match filter {
+                    None => true,
+                    Some(true) => hit.passed,
+                    Some(false) => !hit.passed,
+                };
+                if keep {
+                    rows.push(row.clone());
+                }
+            }
+            (rows, hits.hits.len())
+        };
+        self.rows = rows;
+        self.matched = self.rows.len();
+        self.truncated = false;
+        self.rows_read = total;
+        self.indexed_result = false;
+        self.error = None;
+        self.scroll_offset = 0.0;
+        self.sync_rule_attrs();
+        scrollable::scroll_to(self.scroll_id.clone(), AbsoluteOffset { x: 0.0, y: 0.0 })
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::OpenFile => Self::pick_file(),
+            Message::FileChosen(Some(path)) => self.load_file(path),
+            Message::FileChosen(None) => Task::none(),
+            Message::FilterChanged(value) => {
+                // Do not scan on every keystroke: record the edit and let the
+                // debounce timer start a single scan once typing pauses.
+                self.filter = value;
+                self.filter_focus = Some(FilterFocus::Results);
+                self.last_edit = Some(Instant::now());
+                self.debounce_pending = true;
+                Task::none()
+            }
+            Message::DebounceTick => {
+                if !self.debounce_pending {
+                    return Task::none();
+                }
+                let quiet = self
+                    .last_edit
+                    .map(|at| at.elapsed() >= Duration::from_millis(DEBOUNCE_QUIET_MS))
+                    .unwrap_or(true);
+                if !quiet {
+                    return Task::none();
+                }
+                self.debounce_pending = false;
+                // Skip the scan entirely when the pattern did not change.
+                if self.last_scanned.as_deref() == Some(self.filter.as_str()) {
+                    return Task::none();
+                }
+                self.start_scan()
+            }
+            Message::RunFilter => {
+                self.debounce_pending = false;
+                self.start_scan()
+            }
+            Message::ToggleVisibleOnly(checked) => {
+                self.visible_only = checked;
+                self.start_scan()
+            }
+            Message::ToggleParallel(checked) => {
+                self.parallel = checked;
+                self.start_scan()
+            }
+            Message::ToggleTable(checked) => {
+                self.table = checked;
+                Task::none()
+            }
+            Message::ToggleUseIndex(checked) => {
+                self.use_index = checked;
+                self.start_scan()
+            }
+            Message::LimitSelected(limit) => {
+                self.limit = limit.max(1);
+                self.start_scan()
+            }
+            Message::ToggleIndex(column) => {
+                if self.indexes.remove(&column).is_some() {
+                    self.index_status = Some(format!("dropped index on “{}”", self.header(column)));
+                    // The search falls back to the regex now.
+                    self.start_scan()
+                } else if self.indexing {
+                    self.index_status = Some("an index build is already running".into());
+                    Task::none()
+                } else if let Some(path) = self.path.clone() {
+                    self.indexing = true;
+                    self.index_status =
+                        Some(format!("indexing “{}”…", self.header(column)));
+                    let delimiter = self.delimiter;
+                    let built_path = path.clone();
+                    Task::perform(
+                        async move { build_index(path, delimiter, column) },
+                        move |result| Message::IndexBuilt(column, built_path.clone(), result),
+                    )
+                } else {
+                    Task::none()
+                }
+            }
+            Message::RowClicked(index) => {
+                self.open_detail(index);
+                Task::none()
+            }
+            Message::ChipClicked(row, column) => {
+                let Some(value) = self.rows.get(row).and_then(|values| values.get(column)).cloned()
+                else {
+                    return Task::none();
+                };
+                // A second click on the same chip within the double-click window
+                // also opens the row form, so a clipped value can be read in
+                // full (the tooltip covers the quick look case).
+                let now = Instant::now();
+                let double = self
+                    .last_chip_click
+                    .map(|(when, row0, column0)| {
+                        row0 == row
+                            && column0 == column
+                            && now.duration_since(when) < Duration::from_millis(400)
+                    })
+                    .unwrap_or(false);
+                self.last_chip_click = if double {
+                    None
+                } else {
+                    Some((now, row, column))
+                };
+                if double {
+                    self.open_detail(row);
+                }
+                self.copy_notice = Some(self.header(column).to_string());
+                iced::clipboard::write(value)
+            }
+            Message::ToggleAttributeNames(checked) => {
+                self.show_attr_names = checked;
+                Task::none()
+            }
+            Message::CloseDetail => {
+                self.detail = None;
+                self.copy_notice = None;
+                Task::none()
+            }
+            Message::Escape => {
+                // Escape closes the row form first. Otherwise it clears the
+                // filter box the user was last editing, falling back to the
+                // other one when that box is already empty; clearing the regex
+                // re-runs the scan.
+                if self.detail.is_some() {
+                    self.detail = None;
+                    self.copy_notice = None;
+                    return Task::none();
+                }
+                let attributes_first = self.filter_focus == Some(FilterFocus::Attributes);
+                if attributes_first && !self.attribute_filter.is_empty() {
+                    self.attribute_filter.clear();
+                } else if !attributes_first && !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.debounce_pending = false;
+                    return self.start_scan();
+                } else if !self.attribute_filter.is_empty() {
+                    self.attribute_filter.clear();
+                } else if !self.filter.is_empty() {
+                    self.filter.clear();
+                    self.debounce_pending = false;
+                    return self.start_scan();
+                }
+                Task::none()
+            }
+            Message::CopyValue(attribute, value) => {
+                self.copy_notice = Some(attribute);
+                iced::clipboard::write(value)
+            }
+            Message::Mute(index) => {
+                self.muted.insert(index);
+                self.profile_status = None;
+                self.rescan_if_searching_visible()
+            }
+            Message::Unmute(index) => {
+                self.muted.remove(&index);
+                self.profile_status = None;
+                self.rescan_if_searching_visible()
+            }
+            Message::UnmuteAll => {
+                self.muted.clear();
+                self.profile_status = None;
+                self.rescan_if_searching_visible()
+            }
+            Message::MuteAll => {
+                self.muted = (0..self.headers.len()).collect();
+                self.profile_status = None;
+                self.rescan_if_searching_visible()
+            }
+            Message::ToggleHidden => {
+                self.show_hidden = !self.show_hidden;
+                Task::none()
+            }
+            Message::AttributeFilterChanged(value) => {
+                self.attribute_filter = value;
+                self.filter_focus = Some(FilterFocus::Attributes);
+                Task::none()
+            }
+            Message::ProfileSelected(name) => {
+                self.apply_profile(&name);
+                Task::none()
+            }
+            Message::ClearProfile => {
+                self.current_profile = None;
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::SaveCurrentProfile => {
+                self.save_current_profile();
+                Task::none()
+            }
+            Message::BeginSaveNewProfile => {
+                self.naming_profile = true;
+                self.new_profile_name.clear();
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::NewProfileNameChanged(value) => {
+                self.new_profile_name = value;
+                Task::none()
+            }
+            Message::ConfirmSaveNewProfile => {
+                self.save_new_profile();
+                Task::none()
+            }
+            Message::CancelSaveNewProfile => {
+                self.naming_profile = false;
+                self.new_profile_name.clear();
+                self.profile_status = None;
+                Task::none()
+            }
+            Message::ToggleRulesPanel => {
+                self.show_rules = !self.show_rules;
+                Task::none()
+            }
+            Message::OpenRules => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Rule DSL", &["vl", "rules", "txt"])
+                        .pick_file()
+                        .await
+                        .map(|handle| handle.path().to_path_buf())
+                },
+                Message::RulesChosen,
+            ),
+            Message::RulesChosen(path) => {
+                if let Some(path) = path {
+                    self.rules.path = Some(path);
+                    self.rules.report = None;
+                    self.rules.hits = None;
+                    self.rules.error = None;
+                    self.start_rules_evaluation()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::RulesIdColumnChanged(value) => {
+                self.rules.id_column = value;
+                Task::none()
+            }
+            Message::EvaluateRules => self.start_rules_evaluation(),
+            Message::RulesEvaluated(generation, result) => {
+                if generation != self.rules.generation {
+                    return Task::none();
+                }
+                self.rules.evaluating = false;
+                match result {
+                    Ok(report) => {
+                        self.rules.report = Some(report);
+                        self.rules.error = None;
+                        self.rules.hits = None;
+                        self.rules.hits_filter = None;
+                        self.rules.view_active = false;
+                        self.rules.pending_rule = None;
+                    }
+                    Err(message) => {
+                        self.rules.report = None;
+                        self.rules.error = Some(message);
+                    }
+                }
+                Task::none()
+            }
+            Message::RuleAllRows(rule) => self.show_rule_rows(rule, None),
+            Message::RuleFilterRows(rule, passed) => {
+                self.show_rule_rows(rule, Some(passed))
+            }
+            Message::RuleRowsCollected(generation, _rule, result) => {
+                if generation != self.rules.generation {
+                    return Task::none();
+                }
+                self.rules.collecting = false;
+                self.rules.pending_rule = None;
+                match result {
+                    Ok(hits) => {
+                        self.rules.hits = Some(hits);
+                        self.rules.view_active = true;
+                        self.apply_rule_view()
+                    }
+                    Err(message) => {
+                        self.rules.hits = None;
+                        self.rules.view_active = false;
+                        self.rules.error = Some(message);
+                        Task::none()
+                    }
+                }
+            }
+            Message::ClearRuleView => self.clear_rule_view(),
+            Message::ToggleRuleAttrsOnly(checked) => {
+                self.rules.attrs_only = checked;
+                // Narrow (or restore) the grid's visible attributes right away.
+                self.sync_rule_attrs();
+                Task::none()
+            }
+            Message::Resized(width, height) => {
+                // Keep the virtual viewport fresh so a taller window renders more
+                // rows without waiting for the next scroll event.
+                self.viewport_height = height.max(1.0);
+                // The chip layout and the row form size themselves from the
+                // window width, so always record the latest value.
+                self.window_width = width;
+                Task::none()
+            }
+            Message::Scrolled(viewport) => {
+                self.scroll_offset = viewport.absolute_offset().y;
+                self.viewport_height = viewport.bounds().height.max(1.0);
+                Task::none()
+            }
+            Message::ScanFinished(generation, result) => {
+                if generation != self.generation {
+                    return Task::none();
+                }
+                match result {
+                    Ok(scan) => {
+                        self.rows = scan.rows;
+                        self.matched = scan.matched;
+                        self.truncated = scan.truncated;
+                        self.rows_read = scan.rows_read;
+                        self.indexed_result = scan.indexed;
+                        self.error = None;
+                    }
+                    Err(message) => self.error = Some(message),
+                }
+                self.scanning = false;
+                self.scan_duration = self.scan_started.take().map(|start| start.elapsed());
+                self.scroll_offset = 0.0;
+                // Jump the row list back to the top for the new result set.
+                let reset = scrollable::scroll_to(
+                    self.scroll_id.clone(),
+                    AbsoluteOffset { x: 0.0, y: 0.0 },
+                );
+                // Re-scan when a mute change or a filter edit landed while the
+                // scan was running.
+                let stale = self.last_scanned.as_deref() != Some(self.filter.as_str());
+                if self.dirty || stale {
+                    self.dirty = false;
+                    Task::batch([reset, self.start_scan()])
+                } else {
+                    reset
+                }
+            }
+            Message::IndexBuilt(column, path, result) => {
+                // The file may have been switched while the index was building;
+                // the offsets would be meaningless, so drop the result.
+                if self.path.as_deref() != Some(path.as_path()) {
+                    return Task::none();
+                }
+                self.indexing = false;
+                match result {
+                    Ok(index) => {
+                        let count = index.entries.len();
+                        let name = self.header(column).to_string();
+                        self.indexes.insert(column, Arc::new(index));
+                        self.index_status =
+                            Some(format!("indexed “{name}” ({count} rows)"));
+                        // Re-run the search: the index now serves a prefix query.
+                        self.start_scan()
+                    }
+                    Err(message) => {
+                        self.index_status = Some(message);
+                        Task::none()
+                    }
+                }
+            }
+        }
+    }
+
+    /// The header of a column, or `?` when the index is out of range.
+    fn header(&self, column: usize) -> &str {
+        self.headers.get(column).map(String::as_str).unwrap_or("?")
+    }
+
+    /// Whether the search is currently served by the built indexes (a
+    /// `beginsWith` prefix query) rather than the regex: at least one searched
+    /// column is indexed, index search is enabled, and case-sensitive mode has
+    /// not forced the regex path.
+    fn index_mode(&self) -> bool {
+        self.use_index
+            && !self.case_sensitive
+            && self
+                .indexes
+                .keys()
+                .any(|column| !self.visible_only || !self.muted.contains(column))
+    }
+
+    /// Muting an attribute changes which columns are searched when the
+    /// visible-only mode is on, so that mode needs the results recomputed.
+    fn rescan_if_searching_visible(&mut self) -> Task<Message> {
+        if self.visible_only {
+            self.start_scan()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Snapshot one matching row into the detail form, so the form keeps
+    /// showing it even when a later scan replaces the visible matches.
+    fn open_detail(&mut self, row: usize) {
+        let fields = self.rows.get(row).map(|values| {
+            (0..values.len())
+                .map(|column| (self.header(column).to_string(), values[column].clone()))
+                .collect()
+        });
+        if let Some(fields) = fields {
+            // When the grid is showing a rule's rows, tag the form so the
+            // "rule attributes only" mode can filter it.
+            let rule = self.active_rule();
+            let title = match rule {
+                Some(rule) => format!("Rule {} · match {}", rule + 1, row + 1),
+                None => format!("Match {}", row + 1),
+            };
+            self.detail = Some(DetailState {
+                title,
+                fields,
+                rule,
+            });
+            self.copy_notice = None;
+        }
+    }
+
+    /// Column indices referenced by a rule in the current report.
+    fn rule_columns(&self, rule: usize) -> &[usize] {
+        self.rules
+            .report
+            .as_ref()
+            .and_then(|report| report.rules.get(rule))
+            .map(|rule| rule.rule_columns.as_slice())
+            .unwrap_or(&[])
+    }
+
+    /// App theme, handed to iced once at startup; every custom style above
+    /// reads its colors from the palette it defines.
+    fn theme(&self) -> Theme {
+        modern_theme()
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        let resize = iced::window::resize_events()
+            .map(|(_id, size)| Message::Resized(size.width, size.height));
+        // Poll only while an edit is pending; the handler waits for the quiet
+        // period before starting the scan, which debounces typing bursts.
+        let debounce = if self.debounce_pending {
+            iced::time::every(Duration::from_millis(DEBOUNCE_TICK_MS))
+                .map(|_| Message::DebounceTick)
+        } else {
+            Subscription::none()
+        };
+        // Escape closes the row form or clears the filter box being edited.
+        // `listen_with` rather than `on_key_press`: a focused text input
+        // captures Escape before a subscription that only sees ignored events
+        // would receive it.
+        let escape = if self.detail.is_some()
+            || !self.filter.is_empty()
+            || !self.attribute_filter.is_empty()
+        {
+            iced::event::listen_with(|event, _status, _window| match event {
+                iced::event::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: Key::Named(keyboard::key::Named::Escape),
+                    ..
+                }) => Some(Message::Escape),
+                _ => None,
+            })
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([resize, debounce, escape])
+    }
+
+    fn view(&self) -> Element<'_, Message> {
+        let theme = self.theme();
+        let palette = theme.extended_palette();
+
+        // No file yet: a single floating card with the Open call to action.
+        if self.path.is_none() {
+            return container(
+                container(
+                    column![
+                        container(
+                            text(char::from(Bootstrap::FileEarmarkSpreadsheetFill))
+                                .font(BOOTSTRAP_FONT)
+                                .size(30)
+                                .color(palette.primary.base.color),
+                        )
+                        .padding(16)
+                        .style(|theme: &Theme| container::Style {
+                            background: Some(Background::Color(
+                                theme.extended_palette().primary.weak.color,
+                            )),
+                            border: Border {
+                                radius: 10.0.into(),
+                                ..Border::default()
+                            },
+                            ..container::Style::default()
+                        }),
+                        text("No CSV file opened").size(24),
+                        text("Grep and browse rows of a large CSV file.")
+                            .size(14)
+                            .color(muted_text(&theme)),
+                        button(
+                            row![
+                                text(char::from(Bootstrap::FolderFill))
+                                    .font(BOOTSTRAP_FONT)
+                                    .size(16),
+                                text("Open CSV…").size(16),
+                            ]
+                            .spacing(8)
+                            .align_y(Center),
+                        )
+                        .on_press(Message::OpenFile)
+                        .padding([12, 24])
+                        .style(primary_button),
+                    ]
+                    .spacing(14)
+                    .align_x(Center),
+                )
+                .padding(40)
+                .style(card_style),
+            )
+            .center_x(Fill)
+            .center_y(Fill)
+            .into();
+        }
+
+        // Small app mark: an accent tile with the spreadsheet glyph.
+        let brand = row![
+            container(
+                text(char::from(Bootstrap::FileEarmarkSpreadsheetFill))
+                    .font(BOOTSTRAP_FONT)
+                    .size(14)
+                    .color(Color::WHITE),
+            )
+            .padding([5, 6])
+            .style(|theme: &Theme| container::Style {
+                background: Some(Background::Color(theme.extended_palette().primary.base.color)),
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Border::default()
+                },
+                ..container::Style::default()
+            }),
+            text("fview").size(16),
+        ]
+        .spacing(8)
+        .align_y(Center);
+
+        let open = button(
+            row![
+                text(char::from(Bootstrap::FolderFill))
+                    .font(BOOTSTRAP_FONT)
+                    .size(14),
+                text("Open…"),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::OpenFile)
+        .padding([8, 14])
+        .style(secondary_button);
+
+        let file_name = self
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        let filter_hint = if self.index_mode() {
+            "beginsWith prefix over indexed columns, e.g. Fra"
+        } else {
+            "regex filter, e.g. \\d{4}-\\d{2}"
+        };
+        let filter = text_input(filter_hint, &self.filter)
+            .on_input(Message::FilterChanged)
+            .on_submit(Message::RunFilter)
+            .padding(10)
+            .size(14)
+            .width(Fill)
+            .style(input_style);
+
+        let search = button(
+            row![
+                text(char::from(Bootstrap::Search)).font(BOOTSTRAP_FONT),
+                text("Search"),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::RunFilter)
+        .padding([10, 18])
+        .style(primary_button);
+
+        let status: Element<'_, Message> = if let Some(error) = &self.error {
+            row![
+                text(char::from(Bootstrap::ExclamationTriangle))
+                    .font(BOOTSTRAP_FONT)
+                    .size(13)
+                    .color(palette.danger.base.color),
+                text(error.as_str()).size(13).color(palette.danger.base.color),
+            ]
+            .spacing(6)
+            .align_y(Center)
+            .into()
+        } else if let Some(active) = self.active_rule() {
+            let label = match self.rules.hits_filter {
+                None => "all rows",
+                Some(true) => "matching rows",
+                Some(false) => "failing rows",
+            };
+            row![
+                text(char::from(Bootstrap::ClipboardCheck))
+                    .font(BOOTSTRAP_FONT)
+                    .size(13)
+                    .color(palette.primary.base.color),
+                text(format!(
+                    "rule {} · {label} ({})",
+                    active + 1,
+                    self.rows.len()
+                ))
+                .size(13)
+                .color(palette.primary.base.color),
+                button(text("clear").size(12))
+                    .on_press(Message::ClearRuleView)
+                    .padding([1, 8])
+                    .style(ghost_button),
+            ]
+            .spacing(8)
+            .align_y(Center)
+            .into()
+        } else if self.scanning {
+            row![
+                text(char::from(Bootstrap::HourglassSplit))
+                    .font(BOOTSTRAP_FONT)
+                    .size(13)
+                    .color(palette.primary.base.color),
+                text("scanning…").size(13).color(palette.primary.base.color),
+            ]
+            .spacing(6)
+            .align_y(Center)
+            .into()
+        } else {
+            text(status_text(
+                self.rows.len(),
+                self.matched,
+                self.rows_read,
+                self.truncated,
+                self.indexed_result,
+                self.scan_duration,
+            ))
+            .size(13)
+            .color(muted_text(&theme))
+            .into()
+        };
+
+        // Opt-in scan modes: skip hidden columns, read the whole file in
+        // parallel, render as a table, or use the built column indexes for a
+        // `beginsWith` search. The "rows" drop-down sets how many matches are
+        // kept.
+        let mut limit_choices = ROW_LIMIT_CHOICES.to_vec();
+        if !limit_choices.contains(&self.limit) {
+            limit_choices.push(self.limit);
+            limit_choices.sort_unstable();
+        }
+        let options = row![
+            checkbox("visible only", self.visible_only)
+                .on_toggle(Message::ToggleVisibleOnly)
+                .text_size(12)
+                .style(checkbox_style),
+            checkbox("parallel", self.parallel)
+                .on_toggle(Message::ToggleParallel)
+                .text_size(12)
+                .style(checkbox_style),
+            checkbox("table", self.table)
+                .on_toggle(Message::ToggleTable)
+                .text_size(12)
+                .style(checkbox_style),
+            checkbox("index", self.use_index)
+                .on_toggle_maybe((!self.indexes.is_empty()).then_some(Message::ToggleUseIndex))
+                .text_size(12)
+                .style(checkbox_style),
+            checkbox("attribute names", self.show_attr_names)
+                .on_toggle(Message::ToggleAttributeNames)
+                .text_size(12)
+                .style(checkbox_style),
+            Space::with_width(16),
+            text("rows").size(12).color(muted_text(&theme)),
+            pick_list(limit_choices, Some(self.limit), Message::LimitSelected)
+                .padding(4)
+                .text_size(12)
+                .style(pick_list_style),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .wrap();
+
+        // Opens the rule-evaluation panel below the toolbar.
+        let rules_button = button(
+            row![
+                text(char::from(Bootstrap::ClipboardCheck))
+                    .font(BOOTSTRAP_FONT)
+                    .size(14),
+                text("Rules"),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::ToggleRulesPanel)
+        .padding([8, 14])
+        .style(secondary_button);
+
+        let toolbar = container(
+            row![
+                brand,
+                open,
+                rules_button,
+                container(text(file_name).size(13).color(muted_text(&theme)))
+                    .padding([4, 10])
+                    .style(badge_style),
+                Space::with_width(2),
+                text("Filter").size(13).color(muted_text(&theme)),
+                filter,
+                search,
+            ]
+            .spacing(10)
+            .align_y(Center),
+        )
+        .padding(12)
+        .width(Fill)
+        .style(card_style);
+
+        // The status gets its own line so a long message cannot squeeze the
+        // filter field in the bar above. It keeps a fixed height because the
+        // scanning/error states are taller than plain status text and would
+        // otherwise shift the table down by a few pixels. A chip or form copy
+        // is confirmed on the right of the same line.
+        let mut status_line = Row::new().spacing(8).align_y(Center).push(status);
+        status_line = status_line.push(Space::with_width(Fill));
+        if let Some(attribute) = &self.copy_notice {
+            status_line = status_line.push(
+                row![
+                    text(char::from(Bootstrap::CheckLg))
+                        .font(BOOTSTRAP_FONT)
+                        .size(12)
+                        .color(palette.success.strong.color),
+                    text(format!("copied {attribute}"))
+                        .size(12)
+                        .color(palette.success.strong.color),
+                ]
+                .spacing(4)
+                .align_y(Center),
+            );
+        }
+        let status_bar = container(status_line)
+            .height(Length::Fixed(STATUS_HEIGHT))
+            .align_y(Center)
+            .padding([0.0, 4.0]);
+
+        // Chip geometry: how many chips fit on a line depends on how wide a chip
+        // actually is, which follows the visible values (or the headers when the
+        // attribute names are shown). `columns`/`chip_max` are uniform for the
+        // whole list so every stripe keeps the same height, which is what the
+        // virtual scrolling relies on.
+        let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
+        let visible_columns: Vec<usize> = (0..self.headers.len())
+            .filter(|index| !self.muted.contains(index))
+            .collect();
+        let chip_width = typical_chip_width(
+            &self.rows,
+            &visible_columns,
+            &self.headers,
+            self.show_attr_names,
+        );
+        let (columns, chip_max, hidden_columns) = chip_layout(self.window_width, chip_width);
+
+        // The scan/view options live with the attribute controls (rather than
+        // squeezed into the search bar) and wrap on narrow windows.
+        let mut hidden_bar = column![options].spacing(8).padding(0);
+        let mut controls = Row::new().spacing(10).align_y(Center).width(Fill);
+        controls = controls.push(
+            button(
+                row![
+                    text(char::from(Bootstrap::EyeSlash))
+                        .font(BOOTSTRAP_FONT)
+                        .size(13),
+                    text("Hide all").size(13),
+                ]
+                .spacing(5)
+                .align_y(Center),
+            )
+            .on_press(Message::MuteAll)
+            .padding([3, 8])
+            .style(secondary_button),
+        );
+        if !self.muted.is_empty() {
+            // Collapsible list of hidden attributes: long lists would otherwise
+            // push the data rows off screen.
+            let caret = if self.show_hidden {
+                Bootstrap::CaretDown
+            } else {
+                Bootstrap::CaretRight
+            };
+            controls = controls.push(
+                button(
+                    row![
+                        text(char::from(caret)).font(BOOTSTRAP_FONT).size(13),
+                        text(format!("Hidden ({})", self.muted.len())).size(13),
+                    ]
+                    .spacing(5)
+                    .align_y(Center),
+                )
+                .on_press(Message::ToggleHidden)
+                .padding([3, 8])
+                .style(secondary_button),
+            );
+            controls = controls.push(
+                button(text("show all").size(13))
+                    .on_press(Message::UnmuteAll)
+                    .padding([3, 8])
+                    .style(ghost_button),
+            );
+        }
+        // Attribute filter: highlights matching chips in the main view and
+        // narrows the hidden attribute list below to the matching names.
+        controls = controls.push(separator());
+        controls = controls.push(text("Attributes").size(13).color(muted_text(&theme)));
+        controls = controls.push(
+            text_input("filter attributes…", &self.attribute_filter)
+                .on_input(Message::AttributeFilterChanged)
+                .padding(8)
+                .size(13)
+                .style(input_style)
+                .width(Length::Fixed(200.0)),
+        );
+
+        // Profile controls sit on the right of the bar: pick a saved profile,
+        // overwrite it, or save the current visible set under a new name.
+        let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
+        controls = controls.push(Space::with_width(Fill));
+        controls = controls.push(separator());
+        controls = controls.push(text("Profile").size(13).color(muted_text(&theme)));
+        controls = controls.push(
+            pick_list(
+                profile_names,
+                self.current_profile.clone(),
+                Message::ProfileSelected,
+            )
+            .placeholder("none")
+            .padding(8)
+            .text_size(13)
+            .style(pick_list_style),
+        );
+        if self.current_profile.is_some() {
+            controls = controls.push(
+                button(text("Save").size(13))
+                    .on_press(Message::SaveCurrentProfile)
+                    .padding([3, 8])
+                    .style(primary_button),
+            );
+            controls = controls.push(
+                button(text("clear").size(13))
+                    .on_press(Message::ClearProfile)
+                    .padding([3, 8])
+                    .style(ghost_button),
+            );
+        }
+        controls = controls.push(
+            button(text("Save as new…").size(13))
+                .on_press(Message::BeginSaveNewProfile)
+                .padding([3, 8])
+                .style(secondary_button),
+        );
+        if let Some(status) = &self.profile_status {
+            controls = controls.push(text(status.as_str()).size(12));
+        }
+        if let Some(status) = &self.index_status {
+            controls = controls.push(text(status.as_str()).size(12));
+        }
+        hidden_bar = hidden_bar.push(controls);
+
+        // Prompt for the name of a new profile.
+        if self.naming_profile {
+            hidden_bar = hidden_bar.push(
+                row![
+                    text("New profile name:").size(13).color(muted_text(&theme)),
+                    text_input("profile name", &self.new_profile_name)
+                        .on_input(Message::NewProfileNameChanged)
+                        .on_submit(Message::ConfirmSaveNewProfile)
+                        .padding(8)
+                        .size(13)
+                        .style(input_style)
+                        .width(Length::Fixed(200.0)),
+                    button(text("Save").size(13))
+                        .on_press(Message::ConfirmSaveNewProfile)
+                        .padding([3, 8])
+                        .style(primary_button),
+                    button(text("Cancel").size(13))
+                        .on_press(Message::CancelSaveNewProfile)
+                        .padding([3, 8])
+                        .style(ghost_button),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+        // The hidden attribute names are sorted alphabetically so a large
+        // attribute list stays easy to scan. The list is collapsed by default
+        // (a long list would otherwise push the rows off screen); it opens when
+        // the user toggles it or searches for an attribute. When collapsed only
+        // a note with the count is shown.
+        if !self.muted.is_empty() {
+            let searching = !self.attribute_filter.trim().is_empty();
+            if !self.show_hidden && !searching {
+                hidden_bar = hidden_bar.push(text(hidden_note(self.muted.len())).size(13));
+            } else {
+                let mut indices: Vec<usize> = self.muted.iter().copied().collect();
+                indices.sort_by(|a, b| {
+                    let left = self.headers.get(*a).map(String::as_str).unwrap_or("");
+                    let right = self.headers.get(*b).map(String::as_str).unwrap_or("");
+                    left.to_lowercase()
+                        .cmp(&right.to_lowercase())
+                        .then_with(|| a.cmp(b))
+                });
+                let mut line = Row::new().spacing(6).align_y(Center);
+                let mut count = 0usize;
+                let mut shown = 0usize;
+                for index in indices {
+                    let Some(name) = self.headers.get(index) else {
+                        continue;
+                    };
+                    if searching && !attr_matches(&self.attribute_filter, name) {
+                        continue;
+                    }
+                    if count == hidden_columns {
+                        hidden_bar = hidden_bar.push(line);
+                        line = Row::new().spacing(6).align_y(Center);
+                        count = 0;
+                    }
+                    // Mirror the visible chips: a database icon toggles the
+                    // index and the eye reveals the attribute again.
+                    let indexed = self.indexes.contains_key(&index);
+                    let database = if indexed {
+                        Bootstrap::DatabaseFill
+                    } else {
+                        Bootstrap::Database
+                    };
+                    line = line.push(
+                        container(
+                            row![
+                                text(name).size(13),
+                                button(
+                                    text(char::from(database))
+                                        .font(BOOTSTRAP_FONT)
+                                        .size(14),
+                                )
+                                .on_press(Message::ToggleIndex(index))
+                                .padding(2)
+                                .style(ghost_button),
+                                button(
+                                    text(char::from(Bootstrap::Eye))
+                                        .font(BOOTSTRAP_FONT)
+                                        .size(14),
+                                )
+                                .on_press(Message::Unmute(index))
+                                .padding(2)
+                                .style(ghost_button),
+                            ]
+                            .spacing(6)
+                            .align_y(Center),
+                        )
+                        .padding([3, 8])
+                        .style(move |theme| chip_style(theme, false, indexed)),
+                    );
+                    count += 1;
+                    shown += 1;
+                }
+                if shown > 0 {
+                    hidden_bar = hidden_bar.push(line);
+                } else {
+                    hidden_bar =
+                        hidden_bar.push(text("no hidden attributes match the filter").size(13));
+                }
+            }
+        }
+
+        // The attribute/profile controls sit in their own card below the
+        // toolbar, so the search row keeps the full window width.
+        let controls_card = container(hidden_bar)
+            .width(Fill)
+            .padding([10, 12])
+            .style(card_style);
+
+        // Table geometry: each column keeps at least `TABLE_CELL_MIN_WIDTH`, so
+        // the table grows horizontally instead of squeezing columns into the
+        // window. `show_table` is false when there is nothing to tabulate.
+        let show_table = self.table && !all_hidden && !self.headers.is_empty();
+        let column_widths: Vec<f32> = visible_columns
+            .iter()
+            .map(|&column| {
+                (self.header(column).chars().count() as f32 * CHAR_WIDTH + 24.0)
+                    .max(TABLE_CELL_MIN_WIDTH)
+            })
+            .collect();
+        let table_width: f32 = column_widths.iter().sum::<f32>().max(1.0);
+
+        // Right padding keeps the chips (and the table) clear of the scrollbar,
+        // which iced draws over the right edge of the scrollable.
+        let mut list = column![]
+            .spacing(0)
+            .padding(Padding {
+                right: 14.0,
+                ..Padding::ZERO
+            });
+        if self.rows.is_empty() {
+            let message = if self.scanning {
+                "scanning…"
+            } else {
+                "no rows match the filter"
+            };
+            list = list.push(container(text(message).size(14)).padding(12));
+        } else if all_hidden {
+            list = list.push(
+                container(
+                    text("All attributes hidden — reveal the Hidden list above, then click an attribute to display it.")
+                        .size(14),
+                )
+                .padding(12),
+            );
+        } else {
+            // Virtual scrolling: only the rows intersecting the viewport (plus a
+            // small overscan) are built, so a long list costs the same per frame
+            // as a short one. Every row is given the same fixed height, which
+            // keeps the computed offsets exact.
+            let total_rows = self.rows.len();
+            let viewport = self.viewport_height.max(1.0);
+            let row_height = if show_table {
+                TABLE_ROW_HEIGHT
+            } else {
+                let line_count = visible_columns.len().div_ceil(columns).max(1);
+                stripe_height(line_count)
+            };
+
+            let first = ((self.scroll_offset / row_height).floor() as usize)
+                .saturating_sub(OVERSCAN_ROWS)
+                .min(total_rows);
+            let last = ((((self.scroll_offset + viewport) / row_height).ceil() as usize)
+                + OVERSCAN_ROWS
+                + 1)
+                .min(total_rows)
+                .max(first);
+
+            // The header lives inside the scrolled content so it stays aligned
+            // when the table scrolls horizontally.
+            if show_table {
+                let mut header_line = Row::new().spacing(0);
+                for (column_position, &column) in visible_columns.iter().enumerate() {
+                    // The header itself is inert now: the database and mute
+                    // icons mirror the controls on the chip view.
+                    let indexed = self.indexes.contains_key(&column);
+                    let database = if indexed {
+                        Bootstrap::DatabaseFill
+                    } else {
+                        Bootstrap::Database
+                    };
+                    let cell = row![
+                        text(self.header(column)).size(13).width(Fill),
+                        button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
+                            .on_press(Message::ToggleIndex(column))
+                            .padding(2)
+                            .style(ghost_button),
+                        button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
+                            .on_press(Message::Mute(column))
+                            .padding(2)
+                            .style(ghost_button),
+                    ]
+                    .spacing(4)
+                    .align_y(Center);
+                    header_line = header_line.push(
+                        container(cell)
+                            .width(Length::Fixed(column_widths[column_position]))
+                            .padding([5, 10])
+                            .style(move |theme: &Theme| header_cell_style(theme, indexed)),
+                    );
+                }
+                list = list.push(
+                    container(header_line)
+                        .width(Length::Fixed(table_width))
+                        .style(stripe_style(true)),
+                );
+                // Hairline under the header so the first row reads as data.
+                list = list.push(
+                    container(horizontal_rule(1).style(divider_style))
+                        .width(Length::Fixed(table_width)),
+                );
+            }
+
+            if first > 0 {
+                list = list.push(Space::with_height(Length::Fixed(
+                    first as f32 * row_height,
+                )));
+            }
+
+            for (offset, values) in self.rows[first..last].iter().enumerate() {
+                let index = first + offset;
+                if show_table {
+                    let mut line = Row::new().spacing(0);
+                    for (column_position, &column) in visible_columns.iter().enumerate() {
+                        let cell = values.get(column).map(String::as_str).unwrap_or("");
+                        line = line.push(
+                            container(text(cell).size(13).wrapping(Wrapping::None))
+                                .width(Length::Fixed(column_widths[column_position]))
+                                .clip(true)
+                                .padding([3, 10]),
+                        );
+                    }
+                    let striped = index % 2 == 1;
+                    list = list.push(
+                        button(
+                            container(line)
+                                .width(Length::Fixed(table_width))
+                                .height(Length::Fixed(row_height))
+                                .clip(true),
+                        )
+                        .on_press(Message::RowClicked(index))
+                        .padding(0)
+                        .width(Length::Fixed(table_width))
+                        .height(Length::Fixed(row_height))
+                        .style(move |theme, status| row_button_style(theme, status, striped, true)),
+                    );
+                    continue;
+                }
+                let visible: Vec<usize> = (0..values.len())
+                    .filter(|column| !self.muted.contains(column))
+                    .collect();
+                let mut block = column![].spacing(CHIP_LINE_SPACING);
+                for chunk in visible.chunks(columns) {
+                    let mut line = Row::new().spacing(CHIP_SPACING);
+                    for &column in chunk {
+                        let header = self.header(column);
+                        let highlight = attr_matches(&self.attribute_filter, header);
+                        let indexed = self.indexes.contains_key(&column);
+                        line = line.push(chip(
+                            header,
+                            &values[column],
+                            index,
+                            column,
+                            chip_max,
+                            highlight,
+                            indexed,
+                            self.show_attr_names,
+                        ));
+                    }
+                    // Clip each chip line to a fixed height so a very long value
+                    // cannot make one stripe taller than the rest.
+                    block = block.push(
+                        container(line)
+                            .height(Length::Fixed(chip_line_box()))
+                            .clip(true),
+                    );
+                }
+                // The stripe is a button too: clicking the row (but not a chip,
+                // which captures its own click) opens the same attribute form as
+                // a table row.
+                let striped = index % 2 == 1;
+                list = list.push(
+                    button(
+                        container(block)
+                            .width(Fill)
+                            .height(Length::Fixed(row_height))
+                            .clip(true)
+                            .padding([STRIPE_PADDING, 12.0]),
+                    )
+                    .on_press(Message::RowClicked(index))
+                    .padding(0)
+                    .width(Fill)
+                    .height(Length::Fixed(row_height))
+                    .style(move |theme, status| row_button_style(theme, status, striped, false)),
+                );
+            }
+
+            if last < total_rows {
+                list = list.push(Space::with_height(Length::Fixed(
+                    (total_rows - last) as f32 * row_height,
+                )));
+            }
+        }
+
+        // Table mode scrolls both ways: the columns keep a comfortable width and
+        // the table grows horizontally rather than being squeezed into the
+        // window.
+        let direction = if show_table {
+            scrollable::Direction::Both {
+                vertical: scrollable::Scrollbar::default(),
+                horizontal: scrollable::Scrollbar::default(),
+            }
+        } else {
+            scrollable::Direction::Vertical(scrollable::Scrollbar::default())
+        };
+
+        let main_col: Element<'_, Message> = column![
+            toolbar,
+            status_bar,
+            controls_card,
+            container(
+                scrollable(list)
+                    .id(self.scroll_id.clone())
+                    .on_scroll(Message::Scrolled)
+                    .direction(direction)
+                    .style(scrollbar_style)
+                    .height(Fill)
+                    .width(Fill),
+            )
+            .width(Fill)
+            .height(Fill)
+            .clip(true)
+            .style(card_style),
+        ]
+        .spacing(8)
+        .height(Fill)
+        .into();
+
+        // The rule panel is docked on the left and runs the full window height.
+        let content: Element<'_, Message> = if self.show_rules {
+            row![self.rules_sidebar(), main_col]
+                .spacing(8)
+                .width(Fill)
+                .height(Fill)
+                .into()
+        } else {
+            main_col
+        };
+        let content = container(content)
+            .padding(10)
+            .width(Fill)
+            .height(Fill)
+            .into();
+
+        // The row detail form floats above the table; `opaque` keeps clicks on
+        // the backdrop from reaching the rows underneath. When it was opened
+        // from the rules panel and the "rule attributes only" mode is on, only
+        // the columns the rule references are shown.
+        match &self.detail {
+            Some(detail) => {
+                let fields: Vec<(String, String)> = if self.rules.attrs_only {
+                    detail
+                        .rule
+                        .map(|rule| {
+                            let allowed = self.rule_columns(rule);
+                            detail
+                                .fields
+                                .iter()
+                                .enumerate()
+                                .filter(|(index, _)| allowed.contains(index))
+                                .map(|(_, pair)| pair.clone())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| detail.fields.clone())
+                } else {
+                    detail.fields.clone()
+                };
+                stack([
+                    content,
+                    detail_form(
+                        &detail.title,
+                        &fields,
+                        self.copy_notice.as_deref(),
+                        self.window_width,
+                        &theme,
+                    ),
+                ])
+                .into()
+            }
+            None => content,
+        }
+    }
+
+    /// The rule-evaluation panel: pick/relaunch a rule file, then browse the
+    /// per-rule matching and failing rows. Clicking a rule loads its complete
+    /// pass/fail list; clicking an id opens that row.
+    fn rules_sidebar(&self) -> Element<'_, Message> {
+        let theme = self.theme();
+        let palette = theme.extended_palette();
+
+        let rules_name = self
+            .rules
+            .path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "no rules file".to_string());
+
+        let open_rules = button(
+            row![
+                text(char::from(Bootstrap::FolderFill))
+                    .font(BOOTSTRAP_FONT)
+                    .size(13),
+                text("Open rules…"),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::OpenRules)
+        .padding([6, 12])
+        .style(secondary_button);
+
+        let evaluate = button(
+            row![
+                text(char::from(Bootstrap::PlayFill)).font(BOOTSTRAP_FONT).size(13),
+                text("Evaluate"),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        )
+        .on_press(Message::EvaluateRules)
+        .padding([6, 14])
+        .style(primary_button);
+
+        let close = button(text(char::from(Bootstrap::XLg)).font(BOOTSTRAP_FONT).size(14))
+            .on_press(Message::ToggleRulesPanel)
+            .padding([4, 8])
+            .style(ghost_button);
+
+        let mut header = column![
+            row![
+                text(char::from(Bootstrap::ClipboardCheck))
+                    .font(BOOTSTRAP_FONT)
+                    .size(15)
+                    .color(palette.primary.base.color),
+                text("Rules").size(16),
+                Space::with_width(Fill),
+                close,
+            ]
+            .spacing(8)
+            .align_y(Center),
+            row![open_rules, evaluate].spacing(8).align_y(Center),
+            container(text(rules_name).size(12).color(muted_text(&theme)))
+                .padding([3, 8])
+                .style(badge_style),
+            text("id column").size(12).color(muted_text(&theme)),
+            text_input("auto (row numbers)", &self.rules.id_column)
+                .on_input(Message::RulesIdColumnChanged)
+                .on_submit(Message::EvaluateRules)
+                .padding(8)
+                .size(13)
+                .style(input_style)
+                .width(Fill),
+            checkbox("rule attributes only", self.rules.attrs_only)
+                .on_toggle(Message::ToggleRuleAttrsOnly)
+                .text_size(12)
+                .style(checkbox_style),
+        ]
+        .spacing(8);
+
+        if self.rules.evaluating {
+            header = header.push(
+                row![
+                    text(char::from(Bootstrap::HourglassSplit))
+                        .font(BOOTSTRAP_FONT)
+                        .size(13)
+                        .color(palette.primary.base.color),
+                    text("evaluating rules…")
+                        .size(13)
+                        .color(palette.primary.base.color),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+        if let Some(error) = &self.rules.error {
+            header = header.push(
+                row![
+                    text(char::from(Bootstrap::ExclamationTriangle))
+                        .font(BOOTSTRAP_FONT)
+                        .size(13)
+                        .color(palette.danger.base.color),
+                    text(error.as_str()).size(13).color(palette.danger.base.color),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+        // Only the per-rule statistics live here; the rows are shown in the
+        // main grid when a rule (or one of its sides) is selected.
+        let mut stats = column![].spacing(6);
+        if let Some(report) = &self.rules.report {
+            stats = stats.push(
+                text(format!(
+                    "{} rules · {} passed · {} failed",
+                    report.rules_total, report.rules_passed, report.rules_failed
+                ))
+                .size(12)
+                .color(muted_text(&theme)),
+            );
+            for (index, rule) in report.rules.iter().enumerate() {
+                stats = stats.push(self.rule_card(index, rule, &theme));
+            }
+        } else if !self.rules.evaluating && self.rules.error.is_none() {
+            stats = stats.push(
+                text("Open a rules file to evaluate it against the CSV.")
+                    .size(12)
+                    .color(muted_text(&theme)),
+            );
+        }
+
+        let body = column![
+            header,
+            scrollable(stats)
+                .height(Fill)
+                .width(Fill)
+                .style(scrollbar_style),
+        ]
+        .spacing(10)
+        .height(Fill);
+
+        // Keep the sidebar comfortable without starving the grid on a narrow
+        // window.
+        let sidebar_width = (self.window_width * 0.30).clamp(260.0, 340.0);
+        container(body)
+            .width(Length::Fixed(sidebar_width))
+            .height(Fill)
+            .padding(12)
+            .style(sidebar_style)
+            .into()
+    }
+
+    /// One rule inside the rules panel. The name loads all of the rule's rows
+    /// into the main grid; the `passed` / `failed` counts load just that side.
+    /// While the grid is showing this rule, the aggregated sample is replaced
+    /// by a note so the panel stays a summary.
+    fn rule_card<'a>(
+        &'a self,
+        index: usize,
+        rule: &'a RuleReport,
+        theme: &Theme,
+    ) -> Element<'a, Message> {
+        let status = if rule.passed() { "passed" } else { "failed" };
+        let active = self.active_rule() == Some(index);
+        let filter = if active { self.rules.hits_filter } else { None };
+        let caret = if active {
+            Bootstrap::CaretDownFill
+        } else {
+            Bootstrap::CaretRightFill
+        };
+
+        let name_button = button(
+            row![
+                text(char::from(caret)).font(BOOTSTRAP_FONT).size(12),
+                text(format!("{}. {}", index + 1, rule.name))
+                    .size(14)
+                    .width(Fill)
+                    .wrapping(Wrapping::Word),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        )
+        .on_press(Message::RuleAllRows(index))
+        .padding([4, 4])
+        .width(Fill)
+        .style(ghost_button);
+
+        let passed_button = button(text(format!("passed {}", rule.rows_passed)).size(12))
+            .on_press(Message::RuleFilterRows(index, true))
+            .padding([2, 10])
+            .style(move |theme, status| {
+                filter_button_style(theme, status, filter == Some(true), true)
+            });
+        let failed_button = button(text(format!("failed {}", rule.rows_failed)).size(12))
+            .on_press(Message::RuleFilterRows(index, false))
+            .padding([2, 10])
+            .style(move |theme, status| {
+                filter_button_style(theme, status, filter == Some(false), false)
+            });
+
+        // Statistics go on their own line: a long rule name in the narrow
+        // sidebar must never squeeze them into one letter per line.
+        let stats = row![
+            text(format!("checked {}", rule.rows_checked))
+                .size(12)
+                .color(muted_text(theme)),
+            passed_button,
+            failed_button,
+            text(format!("skipped {}", rule.rows_skipped))
+                .size(12)
+                .color(muted_text(theme)),
+            text(format!(
+                "validation skipped {}",
+                rule.rows_validation_skipped
+            ))
+            .size(12)
+            .color(muted_text(theme)),
+            container(text(status).size(11))
+                .padding([2, 8])
+                .style(move |theme: &Theme| status_badge_style(theme, status)),
+        ]
+        .spacing(6)
+        .align_y(Center)
+        .wrap();
+
+        let mut card = column![name_button, stats].spacing(6).padding(8);
+
+        if active {
+            let label = match filter {
+                None => "all rows",
+                Some(true) => "matching rows",
+                Some(false) => "failing rows",
+            };
+            card = card.push(
+                row![
+                    text(char::from(Bootstrap::ClipboardCheck))
+                        .font(BOOTSTRAP_FONT)
+                        .size(12)
+                        .color(theme.extended_palette().primary.base.color),
+                    text(format!("{label} shown in the grid"))
+                        .size(11)
+                        .width(Fill)
+                        .wrapping(Wrapping::Word)
+                        .color(muted_text(theme)),
+                    button(text("clear").size(11))
+                        .on_press(Message::ClearRuleView)
+                        .padding([1, 8])
+                        .style(ghost_button),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        } else if self.rules.collecting && self.rules.pending_rule == Some(index) {
+            card = card.push(
+                row![
+                    text(char::from(Bootstrap::HourglassSplit))
+                        .font(BOOTSTRAP_FONT)
+                        .size(12),
+                    text("collecting rows…").size(12).color(muted_text(theme)),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+        container(card).width(Fill).style(rule_card_style).into()
+    }
+}
+
+/// The app theme: a soft neutral canvas with a single indigo accent. Two
+/// palettes are defined so a dark-mode desktop keeps a dark window.
+fn modern_theme() -> Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(build_theme).clone()
+}
+
+/// Built once: OS dark mode is only read at startup, so the palette does not
+/// have to be regenerated on every redraw.
+fn build_theme() -> Theme {
+    let palette = if matches!(Theme::default(), Theme::Dark) {
+        Palette {
+            background: Color::from_rgb(0.082, 0.090, 0.118),
+            text: Color::from_rgb(0.902, 0.910, 0.937),
+            primary: Color::from_rgb(0.506, 0.463, 0.976),
+            success: Color::from_rgb(0.204, 0.780, 0.596),
+            danger: Color::from_rgb(0.937, 0.353, 0.353),
+        }
+    } else {
+        Palette {
+            background: Color::from_rgb(0.961, 0.965, 0.980),
+            text: Color::from_rgb(0.106, 0.122, 0.188),
+            primary: Color::from_rgb(0.310, 0.275, 0.898),
+            success: Color::from_rgb(0.020, 0.588, 0.412),
+            danger: Color::from_rgb(0.863, 0.149, 0.149),
+        }
+    };
+    Theme::custom("fview".to_string(), palette)
+}
+
+/// Secondary text: the theme text color faded so hierarchy stays readable in
+/// both light and dark mode.
+fn muted_text(theme: &Theme) -> Color {
+    Color {
+        a: 0.6,
+        ..theme.extended_palette().background.base.text
+    }
+}
+
+/// Floating panel: white surface, hairline border and a soft drop shadow.
+fn card_style(theme: &Theme) -> container::Style {
+    let dark = theme.extended_palette().is_dark;
+    let (surface, border, shadow) = if dark {
+        (
+            Color::from_rgb(0.118, 0.129, 0.169),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+            Color::from_rgba(0.0, 0.0, 0.0, 0.35),
+        )
+    } else {
+        (
+            Color::WHITE,
+            Color::from_rgba(0.06, 0.09, 0.16, 0.08),
+            Color::from_rgba(0.06, 0.09, 0.16, 0.06),
+        )
+    };
+    container::Style {
+        background: Some(Background::Color(surface)),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: CARD_RADIUS.into(),
+        },
+        shadow: Shadow {
+            color: shadow,
+            offset: Vector::new(0.0, 1.0),
+            blur_radius: 6.0,
+        },
+        text_color: None,
+    }
+}
+
+/// Pill used for the file name and other small metadata badges.
+fn badge_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(palette.background.weak.color)),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: 6.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Rounded, softly tinted text input that highlights the accent while focused.
+fn input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let palette = theme.extended_palette();
+    let background = if palette.is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+    } else {
+        Color::from_rgb(0.973, 0.976, 0.988)
+    };
+    let border = if matches!(status, text_input::Status::Focused) {
+        palette.primary.base.color
+    } else {
+        palette.background.strong.color
+    };
+    text_input::Style {
+        background: Background::Color(background),
+        border: Border {
+            color: border,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        icon: palette.background.base.text,
+        placeholder: muted_text(theme),
+        value: palette.background.base.text,
+        selection: palette.primary.weak.color,
+    }
+}
+
+/// Solid accent button (Open, Search, Save).
+fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::primary(theme, status);
+    style.border.radius = RADIUS.into();
+    style.shadow = Shadow {
+        color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+        offset: Vector::new(0.0, 1.0),
+        blur_radius: 4.0,
+    };
+    style
+}
+
+/// Quiet outlined button.
+fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::secondary(theme, status);
+    style.border.radius = RADIUS.into();
+    style
+}
+
+/// Borderless button used for inline/icon actions.
+fn ghost_button(theme: &Theme, status: button::Status) -> button::Style {
+    let mut style = button::text(theme, status);
+    style.border.radius = RADIUS.into();
+    style
+}
+
+/// Rounded checkbox with the accent color and white tick.
+fn checkbox_style(theme: &Theme, status: checkbox::Status) -> checkbox::Style {
+    let checked = matches!(
+        status,
+        checkbox::Status::Active { is_checked: true }
+            | checkbox::Status::Hovered { is_checked: true }
+    );
+    let mut style = if checked {
+        checkbox::primary(theme, status)
+    } else {
+        checkbox::secondary(theme, status)
+    };
+    style.border.radius = 3.0.into();
+    style.border.width = 1.0;
+    style
+}
+
+/// Rounded drop-down matching the text inputs.
+fn pick_list_style(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let palette = theme.extended_palette();
+    let text = palette.background.base.text;
+    let mut style = pick_list::default(theme, status);
+    style.border.radius = RADIUS.into();
+    // The built-in placeholder/handle colors are too faint on the card surface.
+    style.text_color = text;
+    style.placeholder_color = Color { a: 0.75, ..text };
+    style.handle_color = Color { a: 0.7, ..text };
+    style
+}
+
+/// Thin vertical rule used to group the controls bar into clusters.
+fn separator() -> Element<'static, Message> {
+    container(Space::new(
+        Length::Fixed(1.0),
+        Length::Fixed(18.0),
+    ))
+    .style(|theme: &Theme| container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().background.strong.color,
+        )),
+        ..container::Style::default()
+    })
+    .into()
+}
+
+/// Table header cell background: indexed columns keep the success accent.
+fn header_cell_style(theme: &Theme, indexed: bool) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(if indexed {
+            palette.success.weak.color
+        } else {
+            palette.background.weak.color
+        })),
+        ..container::Style::default()
+    }
+}
+
+/// Row background for the table rows and the chip stripes: zebra striping, and
+/// (for the table) an accent tint on hover since the whole row opens the form.
+/// The chip stripes pass `hover_highlight = false`: the row is still clickable,
+/// but hovering it must not flash a highlight behind the chips.
+fn row_button_style(
+    theme: &Theme,
+    status: button::Status,
+    striped: bool,
+    hover_highlight: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    let hovered = hover_highlight
+        && matches!(status, button::Status::Hovered | button::Status::Pressed);
+    let background = if hovered {
+        Some(Background::Color(palette.primary.weak.color))
+    } else if striped {
+        Some(Background::Color(palette.background.weak.color))
+    } else {
+        None
+    };
+    button::Style {
+        background,
+        text_color: palette.background.base.text,
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
+}
+
+/// Row height of one field in the detail form; also used to size the body.
+const FORM_ROW_HEIGHT: f32 = 36.0;
+
+/// Modal form with every attribute of one matching row. The panel is sized from
+/// the field count so a short record does not leave a mostly empty box.
+fn detail_form<'a>(
+    title: &'a str,
+    fields: &[(String, String)],
+    copy_notice: Option<&str>,
+    window_width: f32,
+    theme: &Theme,
+) -> Element<'a, Message> {
+    let palette = theme.extended_palette();
+    // Follow the window instead of a fixed width, so the form stays usable in a
+    // narrow window and does not sprawl in a wide one.
+    let panel_width = (window_width * 0.55).clamp(360.0, 820.0);
+    let label_width = (panel_width * 0.28).clamp(90.0, 170.0);
+    let mut form = column![]
+        .spacing(6)
+        // Clear of the scrollbar, which is drawn over the right edge of the
+        // scrollable and would otherwise cover the copy buttons.
+        .padding(Padding {
+            right: 14.0,
+            ..Padding::ZERO
+        });
+    for (name, value) in fields {
+        form = form.push(
+            row![
+                container(text(name.clone()).size(13).color(muted_text(theme)))
+                    .width(Length::Fixed(label_width))
+                    .align_x(iced::Alignment::End),
+                container(text(value.clone()).size(13).wrapping(Wrapping::Word))
+                    .width(Fill)
+                    .padding([5, 10])
+                    .style(input_like_style),
+                button(
+                    text(char::from(Bootstrap::Clipboard))
+                        .font(BOOTSTRAP_FONT)
+                        .size(13),
+                )
+                .on_press(Message::CopyValue(name.clone(), value.clone()))
+                .padding(4)
+                .style(ghost_button),
+            ]
+            .spacing(8)
+            .align_y(Center),
+        );
+    }
+
+    // Header: a tinted glyph, the match number and a short attribute count.
+    let heading = row![
+        container(
+            text(char::from(Bootstrap::CardList))
+                .font(BOOTSTRAP_FONT)
+                .size(16)
+                .color(palette.primary.base.color),
+        )
+        .padding([8, 9])
+        .style(|theme: &Theme| container::Style {
+            background: Some(Background::Color(
+                theme.extended_palette().primary.weak.color,
+            )),
+            border: Border {
+                radius: 8.0.into(),
+                ..Border::default()
+            },
+            ..container::Style::default()
+        }),
+        column![
+            text(title).size(17),
+            text(if fields.len() == 1 {
+                "1 attribute".to_string()
+            } else {
+                format!("{} attributes", fields.len())
+            })
+            .size(12)
+            .color(muted_text(theme)),
+        ]
+        .spacing(2),
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    let mut header = Row::new().spacing(10).align_y(Center).push(heading);
+    header = header.push(Space::with_width(Fill));
+    if let Some(attribute) = copy_notice {
+        header = header.push(
+            row![
+                text(char::from(Bootstrap::CheckLg))
+                    .font(BOOTSTRAP_FONT)
+                    .size(12)
+                    .color(palette.success.strong.color),
+                text(format!("copied {attribute}"))
+                    .size(12)
+                    .color(palette.success.strong.color),
+            ]
+            .spacing(4)
+            .align_y(Center),
+        );
+    }
+    header = header.push(
+        button(text("Close").size(13))
+            .on_press(Message::CloseDetail)
+            .padding([6, 12])
+            .style(secondary_button),
+    );
+
+    // Keep the body height in step with the fixed-height field rows above.
+    let body_height = (fields.len() as f32 * FORM_ROW_HEIGHT).clamp(60.0, 440.0);
+    let panel = container(
+        column![
+            header,
+            horizontal_rule(1).style(divider_style),
+            scrollable(form)
+                .height(Length::Fixed(body_height))
+                .style(scrollbar_style),
+        ]
+        .spacing(12),
+    )
+    .padding(16)
+    .width(Length::Fixed(panel_width))
+    .style(card_style);
+
+    let overlay = container(opaque(panel))
+        .center_x(Fill)
+        .center_y(Fill)
+        .width(Fill)
+        .height(Fill)
+        .style(|_theme: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.45))),
+            ..container::Style::default()
+        });
+
+    // Clicking the dimmed backdrop closes the form; `opaque(panel)` keeps
+    // presses inside the panel from reaching the backdrop.
+    mouse_area(overlay).on_press(Message::CloseDetail).into()
+}
+
+/// Read-only field box used by the row detail form.
+fn input_like_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(if palette.is_dark {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+        } else {
+            Color::from_rgb(0.973, 0.976, 0.988)
+        })),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Slim, rounded scrollbar that fades into the panel.
+fn scrollbar_style(theme: &Theme, _status: scrollable::Status) -> scrollable::Style {
+    let palette = theme.extended_palette();
+    let scroller = if palette.is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.22)
+    } else {
+        Color::from_rgba(0.06, 0.09, 0.16, 0.22)
+    };
+    let rail = scrollable::Rail {
+        background: None,
+        border: Border {
+            radius: 4.0.into(),
+            ..Border::default()
+        },
+        scroller: scrollable::Scroller {
+            color: scroller,
+            border: Border {
+                radius: 4.0.into(),
+                ..Border::default()
+            },
+        },
+    };
+    scrollable::Style {
+        container: container::Style::default(),
+        vertical_rail: rail,
+        horizontal_rail: rail,
+        gap: None,
+    }
+}
+
+/// Divider between the toolbar and the rows. Kept for the table header
+/// separator, which sits between the sticky header and the first data row.
+fn divider_style(theme: &Theme) -> iced::widget::rule::Style {
+    let palette = theme.extended_palette();
+    iced::widget::rule::Style {
+        color: palette.background.strong.color,
+        width: 1,
+        radius: 0.0.into(),
+        fill_mode: iced::widget::rule::FillMode::Full,
+    }
+}
+
+/// Alternating background used to stripe the data rows.
+fn stripe_style(active: bool) -> impl Fn(&Theme) -> container::Style {
+    move |theme| {
+        if !active {
+            return container::Style::default();
+        }
+        let weak = theme.extended_palette().background.weak.color;
+        container::Style {
+            background: Some(Background::Color(weak)),
+            ..container::Style::default()
+        }
+    }
+}
+
+/// Chip style: a transparent background (the row color shows through) with a
+/// border, so a chip never blends into the plain or the striped row background.
+/// Chips whose attribute is **indexed** get a success accent, and chips matching
+/// the attribute filter get the primary accent.
+fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style {
+    let palette = theme.extended_palette();
+    if indexed {
+        return container::Style {
+            background: Some(Background::Color(palette.success.weak.color)),
+            border: Border {
+                color: palette.success.strong.color,
+                width: 1.5,
+                radius: RADIUS.into(),
+            },
+            ..container::Style::default()
+        };
+    }
+    if highlight {
+        return container::Style {
+            background: Some(Background::Color(palette.primary.weak.color)),
+            border: Border {
+                color: palette.primary.strong.color,
+                width: 1.5,
+                radius: RADIUS.into(),
+            },
+            ..container::Style::default()
+        };
+    }
+    container::Style {
+        background: None,
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// A single chip with an index toggle and a mute icon. `show_name` renders
+/// `attribute = value` instead of the value alone; the tooltip always shows the
+/// full label, and a click copies the value (a double click opens the row form).
+fn chip<'a>(
+    header: &'a str,
+    value: &'a str,
+    row: usize,
+    column: usize,
+    max_width: f32,
+    highlight: bool,
+    indexed: bool,
+    show_name: bool,
+) -> Element<'a, Message> {
+    let full_label = format!("{header} = {value}");
+    let label_text = if show_name {
+        full_label.clone()
+    } else {
+        value.to_string()
+    };
+    let content_width = (max_width - CHIP_CHROME).max(60.0);
+    let clipped = estimate_chip_width(&label_text) > max_width;
+    let label = if clipped {
+        text(label_text)
+            .size(13)
+            .width(Length::Fixed(content_width))
+            .wrapping(Wrapping::Word)
+    } else {
+        text(label_text).size(13)
+    };
+
+    let database = if indexed {
+        Bootstrap::DatabaseFill
+    } else {
+        Bootstrap::Database
+    };
+    let toggle_index = button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
+        .on_press(Message::ToggleIndex(column))
+        .padding(2)
+        .style(ghost_button);
+
+    let mute = button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
+        .on_press(Message::Mute(column))
+        .padding(2)
+        .style(ghost_button);
+
+    // Clicking the chip (anywhere but the two icons, which capture their own
+    // events) copies the cell value to the clipboard.
+    let chip = button(
+        container(row![label, toggle_index, mute].spacing(6).align_y(Center))
+            .padding([3, 8])
+            .style(move |theme| chip_style(theme, highlight, indexed)),
+    )
+    .on_press(Message::ChipClicked(row, column))
+    .padding(0)
+    .style(chip_button_style);
+
+    if !clipped {
+        return chip.into();
+    }
+
+    // Only clipped chips need the overlay; the tooltip reveals the full value
+    // that the two-line limit cuts off.
+    tooltip(
+        chip,
+        container(text(full_label).size(12).wrapping(Wrapping::Word))
+            .width(Length::Fixed(360.0))
+            .padding(8),
+        tooltip::Position::FollowCursor,
+    )
+    .gap(4)
+    .padding(0)
+    .into()
+}
+
+/// Chip wrapper button: invisible apart from a faint accent tint on hover, so
+/// the chip keeps its own border and background.
+fn chip_button_style(theme: &Theme, status: button::Status) -> button::Style {
+    let palette = theme.extended_palette();
+    button::Style {
+        background: match status {
+            button::Status::Hovered | button::Status::Pressed => {
+                Some(Background::Color(palette.primary.weak.color))
+            }
+            _ => None,
+        },
+        text_color: palette.background.base.text,
+        border: Border::default(),
+        shadow: Shadow::default(),
+    }
+}
+
+/// Rough estimate of a chip's width, used to decide whether its label must
+/// wrap. Slightly overestimates so chips err on the side of wrapping.
+fn estimate_chip_width(label: &str) -> f32 {
+    label.chars().count() as f32 * CHAR_WIDTH + CHIP_CHROME
+}
+
+/// Read the header row once so chips can be labelled before the first scan.
+fn read_headers(path: &Path, delimiter: u8) -> Result<Vec<String>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder.delimiter(delimiter).has_headers(true);
+    let mut reader = builder.from_reader(file);
+
+    let headers = reader
+        .byte_headers()
+        .map_err(|e| format!("cannot read headers of {}: {e}", path.display()))?;
+
+    Ok(headers
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect())
+}
+
+/// Memory-map a file read-only. Returns `None` for a zero-length file, which
+/// cannot be mapped.
+fn map_file(path: &Path) -> Result<Option<Mmap>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("cannot stat {}: {e}", path.display()))?
+        .len();
+    if len == 0 {
+        return Ok(None);
+    }
+    // SAFETY: the mapping is read-only and the viewer never writes to the
+    // mapped file while a scan is running.
+    let map = unsafe { Mmap::map(&file) }
+        .map_err(|e| format!("cannot memory-map {}: {e}", path.display()))?;
+    Ok(Some(map))
+}
+
+/// The predicate applied to each data row: an optional regex and an optional
+/// per-column mask. When the mask is set, only columns whose entry is `true`
+/// are tested (used to skip hidden attributes).
+struct Matcher<'a> {
+    regex: Option<&'a Regex>,
+    visible: Option<&'a [bool]>,
+}
+
+impl Matcher<'_> {
+    fn is_match(&self, record: &ByteRecord) -> bool {
+        let Some(regex) = self.regex else {
+            return true;
+        };
+        record.iter().enumerate().any(|(index, cell)| {
+            let searched = match self.visible {
+                Some(mask) => mask.get(index).copied().unwrap_or(false),
+                None => true,
+            };
+            searched && regex.is_match(&String::from_utf8_lossy(cell))
+        })
+    }
+}
+
+/// Copy a record into owned strings for display.
+fn collect_row(record: &ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// Compile a rules file and evaluate it against the open CSV. `collect_hits`
+/// selects a rule whose *every* pass/fail row should be retained (the
+/// "show all rows" action); `None` keeps only the bounded sample.
+fn evaluate_rules(
+    csv: PathBuf,
+    delimiter: u8,
+    rules_path: PathBuf,
+    id_column: String,
+    collect_hits: Option<usize>,
+) -> Result<Report, String> {
+    let headers = engine::read_headers(&csv, delimiter)?;
+    let mut program = dsl::load_file(&rules_path)?;
+    // A few more sample ids than the CLI default makes the panel useful; a
+    // rule-level `report_limit` still wins.
+    program.defaults.report_limit = 50;
+    let plan = rules::compile(program, &headers)?;
+    let id_idx = if id_column.trim().is_empty() {
+        None
+    } else {
+        Some(ColumnResolver::resolve(&id_column, &headers).ok_or_else(|| {
+            format!(
+                "id column '{id_column}' not found (available: {})",
+                headers.join(", ")
+            )
+        })?)
+    };
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let config = EngineConfig {
+        path: csv,
+        delimiter,
+        threads,
+        id_idx,
+        progress: None,
+        collect_hits,
+    };
+    engine::run(&plan, &config)
+}
+
+/// Re-run the evaluation asking the engine to retain every row of one rule, and
+/// return just those rows.
+fn collect_rule_hits(
+    csv: PathBuf,
+    delimiter: u8,
+    rules_path: PathBuf,
+    id_column: String,
+    rule: usize,
+) -> Result<Vec<RowHit>, String> {
+    let mut report = evaluate_rules(csv, delimiter, rules_path, id_column, Some(rule))?;
+    report
+        .rules
+        .get_mut(rule)
+        .map(|entry| std::mem::take(&mut entry.hits))
+        .ok_or_else(|| format!("rule {} not found", rule + 1))
+}
+
+/// Collect one rule's complete pass/fail list *and* the full CSV record for
+/// each hit, so the main grid can render the rows with all their attributes.
+fn load_rule_rows(
+    csv: PathBuf,
+    delimiter: u8,
+    rules_path: PathBuf,
+    id_column: String,
+    rule: usize,
+) -> Result<RuleHits, String> {
+    let hits = collect_rule_hits(csv.clone(), delimiter, rules_path, id_column.clone(), rule)?;
+    let id_idx = if id_column.trim().is_empty() {
+        None
+    } else {
+        let headers = engine::read_headers(&csv, delimiter)?;
+        ColumnResolver::resolve(&id_column, &headers)
+    };
+    let wanted: HashSet<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
+    let by_id = rows_by_id(&csv, delimiter, id_idx, &wanted)?;
+    let rows = hits
+        .iter()
+        .map(|hit| by_id.get(hit.id.as_str()).cloned().unwrap_or_default())
+        .collect();
+    Ok(RuleHits { rule, hits, rows })
+}
+
+/// Single pass over the file collecting the full row for each wanted id. Ids
+/// come from the engine, so this mirrors its `row:N` fallback for files without
+/// an id column.
+fn rows_by_id(
+    path: &Path,
+    delimiter: u8,
+    id_idx: Option<usize>,
+    wanted: &HashSet<&str>,
+) -> Result<HashMap<String, Vec<String>>, String> {
+    let mut found: HashMap<String, Vec<String>> = HashMap::new();
+    if wanted.is_empty() {
+        return Ok(found);
+    }
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder.delimiter(delimiter).has_headers(true).flexible(true);
+    let mut reader = builder.from_reader(file);
+    let mut record = ByteRecord::new();
+    let mut row = 0u64;
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV: {e}")),
+        }
+        row += 1;
+        let id = match id_idx {
+            Some(column) => record
+                .get(column)
+                .map(|cell| String::from_utf8_lossy(cell).trim().to_string())
+                .unwrap_or_default(),
+            None => format!("row:{row}"),
+        };
+        if wanted.contains(id.as_str()) {
+            if !found.contains_key(&id) {
+                found.insert(id.clone(), collect_row(&record));
+            }
+            if found.len() == wanted.len() {
+                break;
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// Stream the whole file, count every match and keep the first `limit` rows.
+/// Runs on a background thread through `Task::perform`.
+///
+/// `parallel` selects the full-file segmented scan (exact totals, no early
+/// exit); otherwise the sequential scan stops as soon as `limit` rows matched.
+/// `visible` restricts the search to the columns whose entry is `true`.
+fn scan(
+    path: PathBuf,
+    delimiter: u8,
+    pattern: String,
+    case_sensitive: bool,
+    limit: usize,
+    visible: Option<Vec<bool>>,
+    parallel: bool,
+) -> Result<ScanResult, String> {
+    let regex = if pattern.trim().is_empty() {
+        None
+    } else {
+        Some(
+            RegexBuilder::new(&pattern)
+                .case_insensitive(!case_sensitive)
+                .build()
+                .map_err(|e| format!("invalid regex: {e}"))?,
+        )
+    };
+
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ScanResult::empty());
+    };
+    let bytes: &[u8] = &mmap;
+    let matcher = Matcher {
+        regex: regex.as_ref(),
+        visible: visible.as_deref(),
+    };
+
+    if parallel {
+        scan_parallel(bytes, delimiter, &matcher, limit)
+    } else {
+        scan_sequential(bytes, delimiter, &matcher, limit)
+    }
+}
+
+/// Sequential scan over the memory map. Stops as soon as `limit` rows matched,
+/// so the totals are only exact when the scan was not truncated.
+fn scan_sequential(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<ScanResult, String> {
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(true)
+        .flexible(true);
+    let mut reader = builder.from_reader(bytes);
+
+    let mut record = ByteRecord::new();
+    let mut rows = Vec::new();
+    let mut matched = 0usize;
+    let mut truncated = false;
+    let mut rows_read = 0usize;
+
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV: {e}")),
+        }
+        rows_read += 1;
+
+        if matcher.is_match(&record) {
+            matched += 1;
+            if rows.len() < limit {
+                rows.push(collect_row(&record));
+            } else {
+                // Stop scanning: only the first `limit` matching rows are shown.
+                truncated = true;
+                break;
+            }
+        }
+    }
+
+    if truncated {
+        // The exact total is unknown because the scan stopped early; report the
+        // rows that were actually kept.
+        matched = rows.len();
+    }
+    Ok(ScanResult {
+        rows,
+        matched,
+        truncated,
+        rows_read,
+        indexed: false,
+    })
+}
+
+/// Record-aligned byte ranges for a parallel scan over a memory map.
+fn segments_for(bytes: &[u8], delimiter: u8, count: usize) -> Result<Vec<(u64, u64)>, String> {
+    let mut builder = simd_csv::SeekerBuilder::new();
+    builder.delimiter(delimiter).has_headers(true);
+    let seeker = builder
+        .from_reader(Cursor::new(bytes))
+        .map_err(|e| format!("cannot seek CSV: {e}"))?;
+    let Some(mut seeker) = seeker else {
+        return Ok(Vec::new());
+    };
+    let ranges = seeker
+        .segments(count.max(1))
+        .map_err(|e| format!("cannot split CSV: {e}"))?;
+    Ok(ranges.into_iter().filter(|(from, to)| to > from).collect())
+}
+
+/// Result of scanning one record-aligned segment.
+struct SegmentScan {
+    rows: Vec<Vec<String>>,
+    matched: usize,
+    rows_read: usize,
+}
+
+fn scan_segment(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    from: u64,
+    to: u64,
+    limit: usize,
+) -> Result<SegmentScan, String> {
+    let slice = bytes.get(from as usize..to as usize).unwrap_or_default();
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true);
+    let mut reader = builder.from_reader(slice);
+
+    let mut record = ByteRecord::new();
+    let mut rows = Vec::new();
+    let mut matched = 0usize;
+    let mut rows_read = 0usize;
+
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV segment: {e}")),
+        }
+        rows_read += 1;
+        if matcher.is_match(&record) {
+            matched += 1;
+            // Keep at most `limit` rows per segment: later segments can never
+            // contribute to the first `limit` rows in file order.
+            if rows.len() < limit {
+                rows.push(collect_row(&record));
+            }
+        }
+    }
+
+    Ok(SegmentScan {
+        rows,
+        matched,
+        rows_read,
+    })
+}
+
+/// Read the whole file in parallel, preserving file order for the rows shown.
+/// This never exits early, so `matched` and `rows_read` are exact totals.
+fn scan_parallel(
+    bytes: &[u8],
+    delimiter: u8,
+    matcher: &Matcher,
+    limit: usize,
+) -> Result<ScanResult, String> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let segments = segments_for(bytes, delimiter, threads)?;
+    if segments.len() <= 1 {
+        // Too small to split: the sequential scan is equivalent.
+        return scan_sequential(bytes, delimiter, matcher, limit);
+    }
+
+    let per_segment: Vec<SegmentScan> = segments
+        .par_iter()
+        .map(|&(from, to)| scan_segment(bytes, delimiter, matcher, from, to, limit))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    // Merge in file order so the displayed rows keep the file's row order.
+    let mut rows = Vec::new();
+    let mut matched = 0usize;
+    let mut rows_read = 0usize;
+    for segment in per_segment {
+        matched += segment.matched;
+        rows_read += segment.rows_read;
+        if rows.len() < limit {
+            rows.extend(segment.rows.into_iter().take(limit - rows.len()));
+        }
+    }
+
+    let truncated = matched > rows.len();
+    Ok(ScanResult {
+        rows,
+        matched,
+        truncated,
+        rows_read,
+        indexed: false,
+    })
+}
+
+/// Build a prefix index for one column: one `(lowercased value, row byte offset)`
+/// entry per data row, then sorted by value. Runs on a background thread.
+fn build_index(path: PathBuf, delimiter: u8, column: usize) -> Result<ColumnIndex, String> {
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ColumnIndex {
+            entries: Vec::new(),
+        });
+    };
+    let bytes: &[u8] = &mmap;
+
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(true)
+        .flexible(true);
+    let mut reader = builder.from_reader(bytes);
+    reader
+        .byte_headers()
+        .map_err(|e| format!("error reading CSV headers: {e}"))?;
+
+    let mut record = ByteRecord::new();
+    let mut entries: Vec<(String, u64)> = Vec::new();
+    loop {
+        // `position` is the start of the record that is about to be read; after
+        // `byte_headers` it points at the first data row.
+        let offset = reader.position();
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading CSV: {e}")),
+        }
+        let value = record
+            .get(column)
+            .map(|cell| String::from_utf8_lossy(cell).to_lowercase())
+            .unwrap_or_default();
+        entries.push((value, offset));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(ColumnIndex { entries })
+}
+
+/// Read the row starting at each byte offset, in the given order, up to `limit`.
+fn rows_at_offsets(
+    bytes: &[u8],
+    delimiter: u8,
+    offsets: &[u64],
+    limit: usize,
+) -> Result<Vec<Vec<String>>, String> {
+    let mut rows = Vec::new();
+    let mut record = ByteRecord::new();
+    for &offset in offsets.iter().take(limit) {
+        let slice = bytes.get(offset as usize..).unwrap_or_default();
+        let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+        builder
+            .delimiter(delimiter)
+            .has_headers(false)
+            .flexible(true);
+        let mut reader = builder.from_reader(slice);
+        match reader.read_byte_record(&mut record) {
+            Ok(true) => rows.push(collect_row(&record)),
+            Ok(false) => {}
+            Err(e) => return Err(format!("error reading CSV row: {e}")),
+        }
+    }
+    Ok(rows)
+}
+
+/// Prefix ("beginsWith") search served by the built column indexes. The set of
+/// matching rows is known from the indexes, so no file scan is needed and the
+/// totals are exact.
+fn scan_indexed(
+    path: PathBuf,
+    delimiter: u8,
+    prefix: String,
+    indexes: Vec<Arc<ColumnIndex>>,
+    limit: usize,
+) -> Result<ScanResult, String> {
+    let Some(mmap) = map_file(&path)? else {
+        return Ok(ScanResult::empty());
+    };
+    let bytes: &[u8] = &mmap;
+
+    let mut offsets: Vec<u64> = Vec::new();
+    for index in &indexes {
+        offsets.extend(index.prefix_offsets(&prefix));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+
+    let matched = offsets.len();
+    let rows = rows_at_offsets(bytes, delimiter, &offsets, limit)?;
+    let truncated = matched > rows.len();
+    Ok(ScanResult {
+        rows,
+        matched,
+        truncated,
+        rows_read: matched,
+        indexed: true,
+    })
+}
+
+/// Tinted pill for a rule's `passed` / `failed` status.
+fn status_badge_style(theme: &Theme, status: &str) -> container::Style {
+    let palette = theme.extended_palette();
+    let (background, text) = if status == "passed" {
+        (palette.success.weak.color, palette.success.strong.color)
+    } else {
+        (palette.danger.weak.color, palette.danger.strong.color)
+    };
+    container::Style {
+        background: Some(Background::Color(background)),
+        border: Border {
+            radius: 999.0.into(),
+            ..Border::default()
+        },
+        text_color: Some(text),
+        ..container::Style::default()
+    }
+}
+
+/// A clickable `passed N` / `failed N` count. When `active`, the chip is tinted
+/// and outlined in the side's colour so the current filter is obvious.
+fn filter_button_style(
+    theme: &Theme,
+    status: button::Status,
+    active: bool,
+    passed: bool,
+) -> button::Style {
+    let palette = theme.extended_palette();
+    let (weak, strong) = if passed {
+        (palette.success.weak.color, palette.success.strong.color)
+    } else {
+        (palette.danger.weak.color, palette.danger.strong.color)
+    };
+    let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+    button::Style {
+        background: if active {
+            Some(Background::Color(weak))
+        } else if hovered {
+            Some(Background::Color(palette.background.weak.color))
+        } else {
+            None
+        },
+        text_color: if active {
+            strong
+        } else {
+            palette.background.base.text
+        },
+        border: Border {
+            color: if active {
+                strong
+            } else {
+                palette.background.strong.color
+            },
+            width: 1.0,
+            radius: 999.0.into(),
+        },
+        shadow: Shadow::default(),
+    }
+}
+
+/// Surface of one rule card inside the panel: a hairline box that separates
+/// rules without competing with the floating panel behind it.
+fn rule_card_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    container::Style {
+        background: Some(Background::Color(if palette.is_dark {
+            Color::from_rgba(1.0, 1.0, 1.0, 0.03)
+        } else {
+            Color::from_rgb(0.980, 0.984, 0.992)
+        })),
+        border: Border {
+            color: palette.background.strong.color,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// Background of the left rule panel. Tinted a little darker than the floating
+/// cards it contains so the two surfaces read as a hierarchy.
+fn sidebar_style(theme: &Theme) -> container::Style {
+    let palette = theme.extended_palette();
+    let mut style = card_style(theme);
+    style.background = Some(Background::Color(if palette.is_dark {
+        Color::from_rgb(0.098, 0.107, 0.141)
+    } else {
+        Color::from_rgb(0.969, 0.973, 0.984)
+    }));
+    style
+}
+
+fn parse_delimiter(raw: &str) -> Result<u8, String> {
+    match raw {
+        "\\t" | "tab" | "TAB" => Ok(b'\t'),
+        other => {
+            let bytes = other.as_bytes();
+            if bytes.len() == 1 {
+                Ok(bytes[0])
+            } else {
+                Err(format!("delimiter must be a single byte, got '{other}'"))
+            }
+        }
+    }
+}
+
+fn main() -> iced::Result {
+    let args = Args::parse();
+
+    // iced selects the compositor from `ICED_BACKEND` (or automatically when it
+    // is unset, which is `wgpu` followed by `tiny-skia`).
+    match args.backend {
+        Backend::Auto => {}
+        Backend::Wgpu => std::env::set_var("ICED_BACKEND", "wgpu"),
+        Backend::TinySkia => std::env::set_var("ICED_BACKEND", "tiny-skia"),
+    }
+
+    iced::application("fview — CSV viewer", Viewer::update, Viewer::view)
+        .subscription(Viewer::subscription)
+        .theme(Viewer::theme)
+        .font(BOOTSTRAP_FONT_BYTES)
+        .window_size((1200.0, 820.0))
+        .run_with(move || Viewer::new(args))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            "compact".into(),
+            ProfileConfig {
+                visible: vec!["id".into(), "name".into()],
+            },
+        );
+        let text = toml::to_string_pretty(&config).unwrap();
+        assert!(text.contains("[profiles.compact]"));
+        let parsed: Config = toml::from_str(&text).unwrap();
+        assert_eq!(parsed.profiles["compact"].visible, vec!["id", "name"]);
+    }
+
+    #[test]
+    fn attr_matches_is_case_insensitive_and_empty_never_matches() {
+        assert!(attr_matches("NAME", "full_name"));
+        assert!(attr_matches("  name ", "full_name"));
+        assert!(!attr_matches("", "full_name"));
+        assert!(!attr_matches("   ", "full_name"));
+        assert!(!attr_matches("age", "full_name"));
+    }
+
+    #[test]
+    fn hidden_note_pluralizes() {
+        assert_eq!(hidden_note(1).matches("attribute").count(), 1);
+        assert!(hidden_note(1).contains("1 hidden attribute available"));
+        assert!(hidden_note(42).contains("42 hidden attributes available"));
+    }
+
+    #[test]
+    fn status_text_reports_rows_read() {
+        assert_eq!(
+            status_text(100, 100, 101, true, false, None),
+            "showing first 100 matching rows (more available) · 101 rows read"
+        );
+        // A full scan knows the exact match total, so it can name it.
+        assert_eq!(
+            status_text(100, 714, 5000, true, false, None),
+            "showing first 100 of 714 matching rows · 5000 rows read"
+        );
+        assert_eq!(
+            status_text(7, 7, 500, false, false, None),
+            "7 matching rows of 500 total"
+        );
+        assert_eq!(status_text(500, 500, 500, false, false, None), "500 rows");
+        // Index results are exact and never read the file.
+        assert_eq!(
+            status_text(100, 714, 714, true, true, None),
+            "showing first 100 of 714 matching rows (index prefix)"
+        );
+        assert_eq!(
+            status_text(7, 7, 7, false, true, None),
+            "7 matching rows (index prefix)"
+        );
+        // A completed search appends how long it took.
+        assert_eq!(
+            status_text(7, 7, 7, false, true, Some(Duration::from_millis(42))),
+            "7 matching rows (index prefix) · 42 ms"
+        );
+        assert_eq!(
+            status_text(500, 500, 500, false, false, Some(Duration::from_millis(1500))),
+            "500 rows · 1.50 s"
+        );
+    }
+
+    #[test]
+    fn scan_counts_rows_read_and_stops_at_limit() {
+        let path = std::env::temp_dir().join(format!("fview-scan-{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\n1,2\n3,4\n5,6\n").unwrap();
+
+        // The limit is hit mid-file, so only part of it is read.
+        let limited = scan(path.clone(), b',', String::new(), false, 2, None, false).unwrap();
+        assert_eq!(limited.rows.len(), 2);
+        assert_eq!(limited.matched, 2);
+        assert!(limited.truncated);
+        assert_eq!(limited.rows_read, 3);
+
+        // A large enough limit reads the whole file.
+        let full = scan(path.clone(), b',', String::new(), false, 10, None, false).unwrap();
+        assert_eq!(full.rows.len(), 3);
+        assert_eq!(full.matched, 3);
+        assert!(!full.truncated);
+        assert_eq!(full.rows_read, 3);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_respects_the_visible_mask() {
+        let path = std::env::temp_dir().join(format!("fview-visible-{}.csv", std::process::id()));
+        std::fs::write(&path, "a,b\nfoo,x\nbar,foo\n").unwrap();
+
+        // Without a mask every column is searched: `foo` hits both rows.
+        let all = scan(path.clone(), b',', "foo".into(), false, 10, None, false).unwrap();
+        assert_eq!(all.rows.len(), 2);
+
+        // With column `b` hidden, row 2 (matched only via `b`) is skipped.
+        let masked = scan(
+            path.clone(),
+            b',',
+            "foo".into(),
+            false,
+            10,
+            Some(vec![true, false]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(masked.rows.len(), 1);
+        assert_eq!(masked.matched, 1);
+
+        // A pattern only present in the hidden column finds nothing.
+        let hidden_only = scan(
+            path.clone(),
+            b',',
+            "x".into(),
+            false,
+            10,
+            Some(vec![true, false]),
+            false,
+        )
+        .unwrap();
+        assert!(hidden_only.rows.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parallel_scan_matches_sequential_and_reports_exact_totals() {
+        let path =
+            std::env::temp_dir().join(format!("fview-parallel-{}.csv", std::process::id()));
+        let mut data = String::from("id,city\n");
+        for i in 0..5000 {
+            data.push_str(&format!("{i},city{}\n", i % 7));
+        }
+        std::fs::write(&path, data).unwrap();
+
+        // Guard the test: if the file cannot be split the parallel path falls
+        // back to the sequential one and the exact totals below are vacuous.
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(segments_for(&bytes, b',', 4).unwrap().len() > 1);
+
+        let sequential =
+            scan(path.clone(), b',', "city3".into(), false, 10, None, false).unwrap();
+        let parallel = scan(path.clone(), b',', "city3".into(), false, 10, None, true).unwrap();
+
+        // Same rows, in the same (file) order.
+        assert_eq!(sequential.rows, parallel.rows);
+        // The full parallel scan reads everything and knows the exact totals.
+        assert_eq!(parallel.rows_read, 5000);
+        assert_eq!(parallel.matched, (0..5000).filter(|i| i % 7 == 3).count());
+        assert!(parallel.truncated);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn index_prefix_search_returns_file_order_offsets() {
+        let index = ColumnIndex {
+            entries: vec![
+                ("apple".into(), 30),
+                ("apricot".into(), 10),
+                ("banana".into(), 20),
+            ],
+        };
+        // Entries are sorted by value, so the result is re-sorted by position.
+        assert_eq!(index.prefix_offsets("ap"), vec![10, 30]);
+        assert_eq!(index.prefix_offsets("ban"), vec![20]);
+        // Matching is case-insensitive.
+        assert_eq!(index.prefix_offsets("APPLE"), vec![30]);
+        assert!(index.prefix_offsets("zzz").is_empty());
+    }
+
+    #[test]
+    fn build_index_offsets_resolve_to_the_right_rows() {
+        let path = std::env::temp_dir().join(format!("fview-index-{}.csv", std::process::id()));
+        std::fs::write(&path, "name,city\nAlice,Paris\nBob,Lyon\nAnna,Nice\n").unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let index = build_index(path.clone(), b',', 0).unwrap();
+        // Sorted by lowercased value: "alice", "anna", "bob".
+        let offsets = index.prefix_offsets("an");
+        assert_eq!(offsets.len(), 1);
+        let rows = rows_at_offsets(&bytes, b',', &offsets, 10).unwrap();
+        assert_eq!(rows, vec![vec!["Anna".to_string(), "Nice".to_string()]]);
+
+        // A broader prefix returns every matching row in file order.
+        let offsets = index.prefix_offsets("a");
+        let rows = rows_at_offsets(&bytes, b',', &offsets, 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0], "Alice");
+        assert_eq!(rows[1][0], "Anna");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn scan_indexed_uses_a_prefix_query_over_the_indexed_column() {
+        let path = std::env::temp_dir().join(format!("fview-scanidx-{}.csv", std::process::id()));
+        std::fs::write(&path, "name,city\nAlice,Paris\nBob,Lyon\nAnna,Nice\n").unwrap();
+
+        let index = Arc::new(build_index(path.clone(), b',', 0).unwrap());
+        let result = scan_indexed(
+            path.clone(),
+            b',',
+            "An".into(),
+            vec![Arc::clone(&index)],
+            10,
+        )
+        .unwrap();
+        assert!(result.indexed);
+        assert_eq!(result.matched, 1);
+        assert_eq!(result.rows, vec![vec!["Anna".to_string(), "Nice".to_string()]]);
+
+        // Prefix search anchors at the start: "li" occurs in "Alice" but no
+        // indexed value starts with it.
+        let none = scan_indexed(path.clone(), b',', "li".into(), vec![index], 10).unwrap();
+        assert_eq!(none.matched, 0);
+        assert!(none.rows.is_empty());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn stripe_height_grows_with_line_count() {
+        // Virtual offsets rely on a stable, positive height.
+        assert!(stripe_height(1) > 0.0);
+        assert!(stripe_height(3) > stripe_height(2));
+        assert!(stripe_height(2) > stripe_height(1));
+        // Degenerate input must not collapse to zero height.
+        assert_eq!(stripe_height(0), stripe_height(1));
+    }
+
+    #[test]
+    fn chip_layout_is_always_usable() {
+        for width in [0.0, 100.0, 600.0, 1200.0, 4000.0] {
+            for chip_width in [0.0, 120.0, 260.0, 800.0] {
+                let (columns, chip_max, hidden_columns) = chip_layout(width, chip_width);
+                assert!(columns >= 1);
+                assert!(hidden_columns >= 1);
+                assert!(chip_max >= 120.0);
+            }
+        }
+        // A wider window fits at least as many chips per line, and narrower
+        // chips fit at least as many as wider ones.
+        assert!(chip_layout(2400.0, 200.0).0 >= chip_layout(800.0, 200.0).0);
+        assert!(chip_layout(1200.0, 120.0).0 >= chip_layout(1200.0, 400.0).0);
+    }
+
+    #[test]
+    fn rows_by_id_collects_full_records() {
+        let dir = std::env::temp_dir().join(format!("fview-rows-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.csv");
+        std::fs::write(&path, "id,name\n1,Alice\n2,Bob\n3,Cara\n").unwrap();
+
+        let wanted: HashSet<&str> = ["1", "3"].into_iter().collect();
+        let found = rows_by_id(&path, b',', Some(0), &wanted).unwrap();
+        assert_eq!(found["1"], vec!["1".to_string(), "Alice".to_string()]);
+        assert_eq!(found["3"], vec!["3".to_string(), "Cara".to_string()]);
+        assert!(!found.contains_key("2"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rows_by_id_uses_row_numbers_without_id_column() {
+        let dir = std::env::temp_dir().join(format!("fview-rows-noid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.csv");
+        std::fs::write(&path, "name\nAlice\nBob\n").unwrap();
+
+        let wanted: HashSet<&str> = ["row:2"].into_iter().collect();
+        let found = rows_by_id(&path, b',', None, &wanted).unwrap();
+        assert_eq!(found["row:2"], vec!["Bob".to_string()]);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

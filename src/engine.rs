@@ -31,8 +31,8 @@ use crate::mapping::{self, MapCounts, Mapping, MappingOrigin};
 use crate::pattern::Separator;
 use crate::progress::Progress;
 use crate::report::{
-    AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RuleReport,
-    TargetExample,
+    AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RowHit,
+    RuleReport, TargetExample,
 };
 use crate::rules::{ColumnRef, CompiledPredicate, MappingPlan, Plan};
 use crate::sampler::{fnv1a, Sampler};
@@ -47,6 +47,10 @@ pub struct EngineConfig {
     pub threads: usize,
     pub id_idx: Option<usize>,
     pub progress: Option<Arc<Progress>>,
+    /// When `Some(index)`, every matching and failing row of that rule is
+    /// collected (in file order) into `RuleReport::hits`. Used by the GUI's
+    /// "show all rows" action; the regular report stays bounded otherwise.
+    pub collect_hits: Option<usize>,
 }
 
 /// Read the header row of the main input.
@@ -246,6 +250,8 @@ struct RuleAccum {
     unmapped: u64,
     pass_results: ResultGroups,
     fail_results: ResultGroups,
+    /// Every row of the rule, collected only when `collect_hits` selects it.
+    hits: Vec<RowHit>,
     /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
     /// reported.
     ambiguous_samples: Sampler<Example>,
@@ -263,6 +269,7 @@ impl RuleAccum {
             unmapped: 0,
             pass_results: ResultGroups::new(limit),
             fail_results: ResultGroups::new(limit),
+            hits: Vec::new(),
             ambiguous_samples: Sampler::new(limit),
         }
     }
@@ -277,6 +284,7 @@ impl RuleAccum {
         self.unmapped += other.unmapped;
         self.pass_results.merge(other.pass_results);
         self.fail_results.merge(other.fail_results);
+        self.hits.extend(other.hits);
         self.ambiguous_samples.merge(other.ambiguous_samples);
     }
 }
@@ -637,6 +645,7 @@ fn validate_segment(
     from: u64,
     to: u64,
     row_base: Option<u64>,
+    collect_hits: Option<usize>,
     progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<RuleAccum>, String> {
     let mut accums: Vec<RuleAccum> = rules
@@ -799,29 +808,57 @@ fn validate_segment(
                 accum.transform_errors += 1;
             }
 
+            // Every row can optionally be retained, in file order, for the
+            // GUI's "show all rows" action; the normal report keeps only the
+            // bounded sample.
+            let want_hits = collect_hits == Some(rule_index);
             if matched {
                 accum.passed += 1;
-                if !accum.pass_results.is_disabled() {
+                if !accum.pass_results.is_disabled() || want_hits {
                     let expected_example =
                         sample_expected(rule.pattern.as_ref(), mapping, expected);
-                    accum.pass_results.observe(
-                        &left_buf,
-                        &right_buf,
-                        expected_example.as_deref(),
-                        &id,
-                    );
+                    if !accum.pass_results.is_disabled() {
+                        accum.pass_results.observe(
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                            &id,
+                        );
+                    }
+                    if want_hits {
+                        accum.hits.push(RowHit {
+                            id: id.clone(),
+                            row: row_number,
+                            left: left_buf.clone(),
+                            right: right_buf.clone(),
+                            expected: expected_example,
+                            passed: true,
+                        });
+                    }
                 }
             } else {
                 accum.failed += 1;
-                if !accum.fail_results.is_disabled() {
+                if !accum.fail_results.is_disabled() || want_hits {
                     let expected_example =
                         sample_expected(rule.pattern.as_ref(), mapping, expected);
-                    accum.fail_results.observe(
-                        &left_buf,
-                        &right_buf,
-                        expected_example.as_deref(),
-                        &id,
-                    );
+                    if !accum.fail_results.is_disabled() {
+                        accum.fail_results.observe(
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                            &id,
+                        );
+                    }
+                    if want_hits {
+                        accum.hits.push(RowHit {
+                            id: id.clone(),
+                            row: row_number,
+                            left: left_buf.clone(),
+                            right: right_buf.clone(),
+                            expected: expected_example,
+                            passed: false,
+                        });
+                    }
                 }
             }
         }
@@ -1020,6 +1057,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                     from,
                     to,
                     row_base,
+                    config.collect_hits,
                     progress,
                 )
             })
@@ -1046,13 +1084,14 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
 
 fn build_report(
     plan: &Plan,
-    accums: Vec<RuleAccum>,
+    mut accums: Vec<RuleAccum>,
     mappings: Vec<Option<Arc<Mapping>>>,
 ) -> Report {
     let mut rules = Vec::with_capacity(plan.rules.len());
     let mut rows_checked = 0u64;
 
     for (index, rule) in plan.rules.iter().enumerate() {
+        let hits = std::mem::take(&mut accums[index].hits);
         let accum = &accums[index];
         rows_checked = rows_checked.max(accum.checked);
 
@@ -1083,6 +1122,8 @@ fn build_report(
             unmapped_values: accum.unmapped,
             pass_results: accum.pass_results.top(),
             fail_results: accum.fail_results.top(),
+            rule_columns: rule.used_columns(),
+            hits,
             mapping: mapping_report,
         });
     }

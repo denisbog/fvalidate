@@ -19,6 +19,22 @@ pub struct TargetExample {
     pub count: u64,
 }
 
+/// One row that matched or failed a rule. Unlike [`GroupedExample`], these are
+/// collected for *every* row (used by the GUI's "show all rows" action) and
+/// carry the transformed values that were compared.
+#[derive(Debug, Clone, Serialize)]
+pub struct RowHit {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row: Option<u64>,
+    pub left: String,
+    pub right: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    /// `true` when the row matched the rule, `false` when it failed.
+    pub passed: bool,
+}
+
 /// Matching or failing rows aggregated by their `(left, right, expected)`
 /// values. `count` is the number of rows in the group and `ids` holds up to
 /// `report_limit` example ids.
@@ -79,6 +95,17 @@ pub struct RuleReport {
     /// Failing rows aggregated by value, most frequent first (up to the
     /// report limit).
     pub fail_results: Vec<GroupedExample>,
+    /// Column indices referenced by the rule (left/right/derive/predicates).
+    /// GUI-only: used to show just the attributes a rule looks at. Not part of
+    /// the serialized report contract.
+    #[allow(dead_code)]
+    #[serde(skip)]
+    pub rule_columns: Vec<usize>,
+    /// Every matching and failing row, in file order. Empty unless the engine
+    /// was asked to collect the hits for this rule (GUI "show all rows").
+    #[allow(dead_code)]
+    #[serde(skip)]
+    pub hits: Vec<RowHit>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<MappingReport>,
 }

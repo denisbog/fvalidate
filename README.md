@@ -484,11 +484,66 @@ Run the bundled example:
 fvalidate examples/loose.csv -r examples/rules_filters.vl --id-column id
 ```
 
+## GUI viewer (`fview`, optional)
+
+An optional [iced](https://iced.rs) window browses a big CSV and can evaluate a
+rules file against the open file. It lives behind the `gui` feature, so the
+default `fvalidate` build stays dependency-light:
+
+```bash
+cargo run --release --features gui --bin fview -- examples/orders.csv
+```
+
+The window has a filter/grep toolbar (regex, per-column prefix indexes, chip or
+table view, hide/show attributes, saved profiles) and a **Rules** button that
+docks a vertical rule panel on the left:
+
+* **Open rules…** picks a `.vl` file; **Evaluate** runs it against the CSV that
+  is currently open. An **id column** box names the column whose values identify
+  rows (leave it empty to use row numbers).
+* The panel shows only the per-rule **statistics** (status and
+  `checked / passed / failed`); the rows themselves are never listed there.
+* Clicking the **rule name** redirects the **main grid** to every matching and
+  failing row of that rule (not just a sample), so the usual chip/table view and
+  its attribute/profiler controls apply to those rows. Clicking the **passed**
+  or **failed** count shows only that side; the active count turns into a
+  **clear** action, and searching returns the grid to the normal scan.
+* The **rule attributes only** checkbox hides every column the active rule does
+  not read from the main grid (and from the row detail form), so a wide file
+  collapses to just the attributes that matter; turning it off restores the
+  previous attribute set.
+* A **rows** drop-down sets how many matching rows the grid keeps (100 by
+  default, up to 10 000); changing it re-runs the search.
+
+The evaluation is performed by the same `engine` the CLI uses, through the
+crate's library target.
+
+### Filtering non-empty values with the regex box
+
+The filter is a regular expression tested as a **substring** against every
+visible cell (case-insensitive unless `--case-sensitive`), and a row matches
+when **any** searched cell matches. To find rows where one column is non-empty:
+
+1. **Hide all** attributes, then click the eye on the column you want (the
+   **Attributes** search finds it quickly).
+2. Keep **visible only** checked so only that column is searched.
+3. Filter with `.` (any character) for *non-empty*, or `\S` for *non-blank* (a
+   cell of spaces does not match).
+
+For several columns, reveal each of them and hide the rest, keeping **visible
+only** on: a row matches when at least one revealed column is non-empty. The
+cells are OR-ed, so one regex cannot require *all* of them to be non-empty; do
+that one column at a time (or with a validation rule). Note that while a column
+is **indexed** and the **index** checkbox is on, a non-empty filter is a
+`beginsWith` prefix query rather than a regex.
+
 ## Project layout
 
 ```
 src/
   main.rs       CLI, stdin spooling, output
+  lib.rs        library target shared by `fvalidate` and `fview`
+  bin/fview.rs  optional GUI viewer + rule-evaluation panel (feature `gui`)
   dsl.rs        DSL tokenizer/parser -> Program
   rules.rs      compilation of rules against headers (column indices)
   transform.rs  value transforms
@@ -524,4 +579,5 @@ cargo test
 ```
 
 Unit tests cover the DSL, transforms and sampler; integration tests run the
-binary end-to-end (including stdin and parallel-equals-sequential).
+binary end-to-end (including stdin and parallel-equals-sequential) and exercise
+the engine's GUI hooks (`collect_hits`, rule columns) through the library.

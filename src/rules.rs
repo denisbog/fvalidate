@@ -237,6 +237,29 @@ pub struct CompiledRule {
     pub report_limit: usize,
 }
 
+impl CompiledRule {
+    /// Every input column index the rule reads: both sides, the `derive`
+    /// expressions and any row predicates. Used by the GUI to show just the
+    /// attributes a rule evaluates.
+    pub fn used_columns(&self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.left.collect_columns(&mut out);
+        self.right.collect_columns(&mut out);
+        if let Some(predicate) = &self.skip {
+            predicate.collect_indices(&mut out);
+        }
+        if let Some(predicate) = &self.auto_mapping_filter {
+            predicate.collect_indices(&mut out);
+        }
+        for derived in &self.derive {
+            derived.expr.column_refs(&mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
 pub struct Plan {
     pub rules: Vec<CompiledRule>,
 }
