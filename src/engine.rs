@@ -32,7 +32,7 @@ use crate::pattern::Separator;
 use crate::progress::Progress;
 use crate::report::{
     AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RowHit,
-    RuleReport, TargetExample,
+    RowOutcome, RuleReport, TargetExample,
 };
 use crate::rules::{ColumnRef, CompiledPredicate, MappingPlan, Plan};
 use crate::sampler::{fnv1a, Sampler};
@@ -47,7 +47,7 @@ pub struct EngineConfig {
     pub threads: usize,
     pub id_idx: Option<usize>,
     pub progress: Option<Arc<Progress>>,
-    /// When `Some(index)`, every matching and failing row of that rule is
+    /// When `Some(index)`, every row of that rule (all outcomes) is
     /// collected (in file order) into `RuleReport::hits`. Used by the GUI's
     /// "show all rows" action; the regular report stays bounded otherwise.
     pub collect_hits: Option<usize>,
@@ -662,10 +662,12 @@ fn validate_segment(
     let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
 
     let mut expected_buf: Vec<String> = Vec::new();
+    let mut matched_buf: Vec<String> = Vec::new();
     let mut left_buf = String::new();
     let mut right_buf = String::new();
     let mut component_buf = String::new();
     let mut component_buf2 = String::new();
+    let mut single_buf = String::new();
     let mut left_tokens: Vec<String> = Vec::new();
     let mut right_tokens: Vec<String> = Vec::new();
     let mut derived: Vec<String> = Vec::new();
@@ -695,7 +697,8 @@ fn validate_segment(
                 if predicate_holds(predicate, &cells, slots, rule.trim) {
                     accum.checked += 1;
                     accum.validation_skipped += 1;
-                    if !accum.skip_results.is_disabled() {
+                    let want_hits = collect_hits == Some(rule_index);
+                    if !accum.skip_results.is_disabled() || want_hits {
                         // Compose the values anyway so the skipped rows are
                         // reported next to the matching and failing ones.
                         let _ = compose_side(
@@ -723,7 +726,20 @@ fn validate_segment(
                             &mut right_buf,
                         );
                         let id = row_id(slots, &cells, row_number, local_row);
-                        accum.skip_results.observe(&left_buf, &right_buf, None, &id);
+                        if !accum.skip_results.is_disabled() {
+                            accum.skip_results.observe(&left_buf, &right_buf, None, &id);
+                        }
+                        if want_hits {
+                            accum.hits.push(RowHit {
+                                id,
+                                row: row_number,
+                                left: left_buf.clone(),
+                                right: right_buf.clone(),
+                                expected: None,
+                                outcome: RowOutcome::ValidationSkipped,
+                                cells: collect_cells(&record),
+                            });
+                        }
                     }
                     continue;
                 }
@@ -762,6 +778,18 @@ fn validate_segment(
             {
                 accum.checked += 1;
                 accum.skipped += 1;
+                if collect_hits == Some(rule_index) {
+                    let id = row_id(slots, &cells, row_number, local_row);
+                    accum.hits.push(RowHit {
+                        id,
+                        row: row_number,
+                        left: left_buf.clone(),
+                        right: right_buf.clone(),
+                        expected: None,
+                        outcome: RowOutcome::Skipped,
+                        cells: collect_cells(&record),
+                    });
+                }
                 continue;
             }
 
@@ -770,8 +798,8 @@ fn validate_segment(
             let id = row_id(slots, &cells, row_number, local_row);
 
             let mapping = mappings[rule_index].as_deref();
-            let expected: &[String];
-            let matched;
+            let mut expected: &[String];
+            let mut matched;
 
             if let Some(pattern) = &rule.pattern {
                 let is_match = pattern.is_match(&left_buf);
@@ -784,15 +812,39 @@ fn validate_segment(
                 fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
                 fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
 
+                // Multi-target file mappings list several acceptable values for
+                // a key; the row passes when the right set satisfies the
+                // comparison against any one of them. Tracked here and resolved
+                // after the right tokens are normalized.
+                let mut multi_target = false;
+                let mut had_unmapped = false;
                 if let Some(mapping) = mapping {
                     let mut count = 0usize;
                     for token in &left_tokens {
+                        if mapping.multi_target {
+                            let targets = mapping.targets_for(token);
+                            if targets.is_empty() {
+                                accum.unmapped += 1;
+                                had_unmapped = true;
+                                // `\u{0}` cannot appear in a real target, so
+                                // this sentinel can never accidentally match.
+                                let slot = token_slot(&mut expected_buf, count);
+                                slot.push('\u{0}');
+                                slot.push_str(token);
+                                count += 1;
+                            } else {
+                                for (target, _) in targets {
+                                    token_slot(&mut expected_buf, count).push_str(target);
+                                    count += 1;
+                                }
+                            }
+                            continue;
+                        }
+
                         match mapping.expected(token) {
                             Some(target) => token_slot(&mut expected_buf, count).push_str(target),
                             None => {
                                 accum.unmapped += 1;
-                                // `\u{0}` cannot appear in a real target, so
-                                // this sentinel can never accidentally match.
                                 let slot = token_slot(&mut expected_buf, count);
                                 slot.push('\u{0}');
                                 slot.push_str(token);
@@ -814,6 +866,7 @@ fn validate_segment(
                     expected_buf.sort_unstable();
                     expected_buf.dedup();
                     expected = &expected_buf;
+                    multi_target = mapping.multi_target;
                 } else {
                     // No mapping: the transformed left value *is* the
                     // expected set, so sort it in place instead of cloning.
@@ -825,7 +878,39 @@ fn validate_segment(
                 right_tokens.sort_unstable();
                 right_tokens.dedup();
 
-                matched = left_ok && right_ok && rule.compare.evaluate(expected, &right_tokens);
+                if multi_target {
+                    let mapping = mapping.expect("mapping is present for multi-target");
+                    matched = false;
+                    if left_ok && right_ok && !had_unmapped {
+                        if rule.compare == CompareOp::Ne {
+                            // `ne` accepts only when the right matches none of
+                            // the acceptable targets.
+                            matched = find_target_match(
+                                CompareOp::Eq,
+                                mapping,
+                                &left_tokens,
+                                &right_tokens,
+                                &mut single_buf,
+                            )
+                            .is_none();
+                        } else if let Some(target) = find_target_match(
+                            rule.compare,
+                            mapping,
+                            &left_tokens,
+                            &right_tokens,
+                            &mut single_buf,
+                        ) {
+                            // Report the value that actually matched instead of
+                            // the whole set of acceptable values.
+                            matched_buf.clear();
+                            matched_buf.push(target.to_string());
+                            expected = &matched_buf;
+                            matched = true;
+                        }
+                    }
+                } else {
+                    matched = left_ok && right_ok && rule.compare.evaluate(expected, &right_tokens);
+                }
             }
 
             accum.checked += 1;
@@ -857,7 +942,8 @@ fn validate_segment(
                             left: left_buf.clone(),
                             right: right_buf.clone(),
                             expected: expected_example,
-                            passed: true,
+                            outcome: RowOutcome::Passed,
+                            cells: collect_cells(&record),
                         });
                     }
                 }
@@ -881,7 +967,8 @@ fn validate_segment(
                             left: left_buf.clone(),
                             right: right_buf.clone(),
                             expected: expected_example,
-                            passed: false,
+                            outcome: RowOutcome::Failed,
+                            cells: collect_cells(&record),
                         });
                     }
                 }
@@ -890,6 +977,39 @@ fn validate_segment(
     }
 
     Ok(accums)
+}
+
+/// Copy every cell of a record into an owned `Vec<String>`. Used only when the
+/// GUI asks the engine to retain the full rows behind a rule's hits, so the
+/// rows come from the same parallel validation pass instead of a second read.
+fn collect_cells(record: &ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// A multi-target mapping stores several acceptable values per key. Return the
+/// first one that satisfies the comparison against the actual right set, so
+/// `eq` means "the right value is one of the mapped values" instead of "the
+/// right value equals the single canonical target".
+fn find_target_match<'a>(
+    compare: CompareOp,
+    mapping: &'a Mapping,
+    left_tokens: &[String],
+    right_tokens: &[String],
+    scratch: &mut String,
+) -> Option<&'a str> {
+    for token in left_tokens {
+        for (target, _) in mapping.targets_for(token) {
+            scratch.clear();
+            scratch.push_str(target);
+            if compare.evaluate(std::slice::from_ref(scratch), right_tokens) {
+                return Some(target);
+            }
+        }
+    }
+    None
 }
 
 /// The id used to identify a row in the report: the trimmed id column, or a
@@ -975,23 +1095,34 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                 multi,
                 separator,
                 filter,
-            } => cache
-                .load(
-                    files,
-                    &mapping::FileMappingSpec {
-                        left_columns: left,
-                        right_columns: right,
-                        left_transforms: &rule.transform_left,
-                        right_transforms: &rule.transform_right,
-                        multi: *multi,
-                        value_separator: separator,
-                        join_separator: &rule.join_separator,
-                        trim: rule.trim,
-                        delimiter: config.delimiter,
-                        filter: filter.as_ref(),
-                    },
-                )
-                .map(Some)?,
+            } => {
+                // When the rule's `right` is a list of columns, the reference
+                // `mapping_right` columns are a composite value to match; a
+                // single `right` column makes several `mapping_right` columns
+                // alternative acceptable targets instead.
+                let right_composite = matches!(
+                    &rule.right,
+                    crate::rules::ColumnRef::Columns(values) if values.len() > 1
+                );
+                cache
+                    .load(
+                        files,
+                        &mapping::FileMappingSpec {
+                            left_columns: left,
+                            right_columns: right,
+                            left_transforms: &rule.transform_left,
+                            right_transforms: &rule.transform_right,
+                            multi: *multi,
+                            value_separator: separator,
+                            join_separator: &rule.join_separator,
+                            trim: rule.trim,
+                            delimiter: config.delimiter,
+                            right_composite,
+                            filter: filter.as_ref(),
+                        },
+                    )
+                    .map(Some)?
+            }
             _ => None,
         };
         mappings.push(mapping);
@@ -1193,7 +1324,7 @@ fn build_mapping_report(
         .map(|(input, targets)| MappingEntry {
             input: input.to_string(),
             canonical: mapping.expected(input).unwrap_or("").to_string(),
-            ambiguous: targets.len() > 1,
+            ambiguous: mapping.is_ambiguous(input),
             targets: targets
                 .iter()
                 .map(|(value, count)| TargetExample {

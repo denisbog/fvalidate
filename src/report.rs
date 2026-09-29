@@ -19,9 +19,26 @@ pub struct TargetExample {
     pub count: u64,
 }
 
-/// One row that matched or failed a rule. Unlike [`GroupedExample`], these are
-/// collected for *every* row (used by the GUI's "show all rows" action) and
-/// carry the transformed values that were compared.
+/// The outcome of one row against a rule. Used by the GUI to browse the rows
+/// behind each statistic, not only passes and failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum RowOutcome {
+    Passed,
+    Failed,
+    Skipped,
+    ValidationSkipped,
+}
+
+impl RowOutcome {
+    #[allow(dead_code)]
+    pub fn passed(self) -> bool {
+        matches!(self, RowOutcome::Passed)
+    }
+}
+
+/// One row that matched, failed, was skipped or was validation-skipped. Unlike
+/// [`GroupedExample`], these are collected for *every* row (used by the GUI's
+/// "show all rows" action) and carry the transformed values that were compared.
 #[derive(Debug, Clone, Serialize)]
 pub struct RowHit {
     pub id: String,
@@ -31,8 +48,21 @@ pub struct RowHit {
     pub right: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expected: Option<String>,
-    /// `true` when the row matched the rule, `false` when it failed.
-    pub passed: bool,
+    /// How the row scored against the rule.
+    pub outcome: RowOutcome,
+    /// The full CSV row, captured in the same validation pass. Filled only
+    /// when the engine is asked to retain every hit (the GUI's "show all
+    /// rows" action); not part of the serialized report.
+    #[allow(dead_code)]
+    #[serde(skip)]
+    pub cells: Vec<String>,
+}
+
+impl RowHit {
+    #[allow(dead_code)]
+    pub fn passed(&self) -> bool {
+        self.outcome.passed()
+    }
 }
 
 /// Matching or failing rows aggregated by their `(left, right, expected)`
@@ -104,8 +134,9 @@ pub struct RuleReport {
     #[allow(dead_code)]
     #[serde(skip)]
     pub rule_columns: Vec<usize>,
-    /// Every matching and failing row, in file order. Empty unless the engine
-    /// was asked to collect the hits for this rule (GUI "show all rows").
+    /// Every row of the rule (all outcomes), in file order. Empty unless the
+    /// engine was asked to collect the hits for this rule (GUI "show all
+    /// rows").
     #[allow(dead_code)]
     #[serde(skip)]
     pub hits: Vec<RowHit>,

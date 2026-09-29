@@ -21,7 +21,9 @@
 //!   names (and highlights the matching chips in the main view);
 //! * every matching row is rendered as a set of `attribute = value` chips, each
 //!   with a mute icon that hides that attribute from all rows and moves its name
-//!   into the top bar.
+//!   into the top bar, and a lock icon that pins the attribute so it always
+//!   stays visible (mute, mute-all, profiles and "rule attributes only" all
+//!   leave locked columns alone).
 //!
 //! Scanning: the filter is **debounced** (a scan starts ~180 ms after the last
 //! keystroke, and an unchanged pattern is never re-scanned). The file is
@@ -33,7 +35,8 @@
 //! Display and indexing: a **table** checkbox renders the matches as a table of
 //! the visible attributes instead of chips. Each chip, and each table header,
 //! carries a database button that builds (or drops) a per-column prefix
-//! **index** and a mute button that hides the attribute; indexed attributes are
+//! **index**, a mute button that hides the attribute and a lock button that
+//! pins it visible; indexed attributes are
 //! highlighted (green background, filled icon) in both views. While an index
 //! exists and the **index** checkbox is on, a non-empty filter becomes a
 //! case-insensitive `beginsWith` prefix query over the indexed columns — served
@@ -61,7 +64,7 @@ use std::time::{Duration, Instant};
 use clap::{Parser, ValueEnum};
 use fast_csv::dsl;
 use fast_csv::engine::{self, EngineConfig};
-use fast_csv::report::{Report, RowHit, RuleReport};
+use fast_csv::report::{Report, RowHit, RowOutcome, RuleReport};
 use fast_csv::rules::{self, ColumnResolver};
 use iced::keyboard::{self, Key};
 use iced::widget::scrollable::AbsoluteOffset;
@@ -94,8 +97,9 @@ const TABLE_ROW_HEIGHT: f32 = 24.0;
 const TABLE_CELL_MIN_WIDTH: f32 = 160.0;
 /// Spacing between chips, in px.
 const CHIP_SPACING: f32 = 8.0;
-/// Non-text width of a chip: padding + index icon + mute icon + inner spacing.
-const CHIP_CHROME: f32 = 66.0;
+/// Non-text width of a chip: padding + index icon + mute icon + lock icon +
+/// inner spacing.
+const CHIP_CHROME: f32 = 90.0;
 /// Non-text height of a chip: vertical padding + border.
 const CHIP_CHROME_V: f32 = 8.0;
 /// Height of a single line of chip text.
@@ -201,12 +205,12 @@ struct RulesState {
     report: Option<Report>,
     error: Option<String>,
     evaluating: bool,
-    /// Complete match/fail list of one rule, with the full CSV row for each
-    /// hit. It feeds the main grid when a rule filter is active.
+    /// Complete row list of one rule (every outcome), with the full CSV row for
+    /// each hit. It feeds the main grid when a rule filter is active.
     hits: Option<RuleHits>,
-    /// Which side of `hits` the grid shows: `None` = every row, `Some(true)` =
-    /// only matching rows, `Some(false)` = only failing rows.
-    hits_filter: Option<bool>,
+    /// Which side of `hits` the grid shows: `None` = every row, otherwise only
+    /// rows with that outcome (passed, failed, skipped, validation-skipped).
+    hits_filter: Option<RowOutcome>,
     /// Whether the main grid currently shows rule rows (rather than scan
     /// results).
     view_active: bool,
@@ -221,10 +225,15 @@ struct RulesState {
     saved_muted: Option<HashSet<usize>>,
     /// Bumped on every evaluation so stale background results are dropped.
     generation: u64,
+    /// When the current rule-row collection started, and how long it took. The
+    /// status line shows the duration next to the row count, like a scan.
+    collect_started: Option<Instant>,
+    collect_duration: Option<Duration>,
 }
 
-/// Every matching and failing row of one rule, together with the full CSV row
-/// for each hit (in `hits` order) so the main grid can render the attributes.
+/// Every row of one rule (passed, failed, skipped or validation-skipped),
+/// together with the full CSV row for each hit (in `hits` order) so the main
+/// grid can render the attributes.
 #[derive(Debug, Clone)]
 struct RuleHits {
     rule: usize,
@@ -502,6 +511,8 @@ enum Message {
     UnmuteAll,
     /// Hide every attribute at once, so a few can be picked back.
     MuteAll,
+    /// Pin/unpin an attribute so it is always visible in the results.
+    ToggleLock(usize),
     /// Expand or collapse the list of hidden attribute chips.
     ToggleHidden,
     /// The attribute search box changed: highlight matching chips and narrow
@@ -531,10 +542,10 @@ enum Message {
     EvaluateRules,
     /// `(generation, result)`; stale generations are ignored.
     RulesEvaluated(u64, Result<Report, String>),
-    /// Collect the complete pass/fail row list for one rule (click on a rule).
+    /// Collect the complete row list for one rule (click on a rule name).
     RuleAllRows(usize),
-    /// Show only one side of a rule's rows: `(rule, passed)`.
-    RuleFilterRows(usize, bool),
+    /// Show only one outcome of a rule's rows: `(rule, outcome)`.
+    RuleFilterRows(usize, RowOutcome),
     /// `(generation, rule, result)`; stale generations are ignored.
     RuleRowsCollected(u64, usize, Result<RuleHits, String>),
     /// Stop filtering the main grid and return to the regular scan results.
@@ -557,6 +568,10 @@ struct Viewer {
     limit: usize,
     headers: Vec<String>,
     muted: HashSet<usize>,
+    /// Columns the user pinned with the lock icon. A locked column is never
+    /// hidden: `mute`, `mute all`, profiles and "rule attributes only" all keep
+    /// it visible.
+    locked: HashSet<usize>,
     /// Whether the list of hidden attribute chips in the top bar is expanded.
     show_hidden: bool,
     filter: String,
@@ -645,6 +660,7 @@ impl Viewer {
             limit: args.limit.max(1),
             headers: Vec::new(),
             muted: HashSet::new(),
+            locked: HashSet::new(),
             show_hidden: false,
             filter: String::new(),
             rows: Vec::new(),
@@ -745,6 +761,7 @@ impl Viewer {
         self.index_status = None;
         self.indexed_result = false;
         self.muted.clear();
+        self.locked.clear();
         self.show_hidden = false;
         self.error = None;
         self.current_profile = None;
@@ -788,7 +805,9 @@ impl Viewer {
             .headers
             .iter()
             .enumerate()
-            .filter(|(_, header)| !visible.contains(header.as_str()))
+            .filter(|(index, header)| {
+                !visible.contains(header.as_str()) && !self.locked.contains(index)
+            })
             .map(|(index, _)| index)
             .collect();
         self.current_profile = Some(name.to_string());
@@ -953,10 +972,10 @@ impl Viewer {
         }
     }
 
-    /// Redirect the main grid to a rule's rows. `filter` selects the side to
+    /// Redirect the main grid to a rule's rows. `filter` selects the outcome to
     /// show. Clicking the same view again clears it and returns the grid to the
     /// regular scan results.
-    fn show_rule_rows(&mut self, rule: usize, filter: Option<bool>) -> Task<Message> {
+    fn show_rule_rows(&mut self, rule: usize, filter: Option<RowOutcome>) -> Task<Message> {
         // Toggling the exact view off restores the scan results.
         if self.rules.view_active
             && self.rules.hits.as_ref().map(|hits| hits.rule) == Some(rule)
@@ -981,6 +1000,7 @@ impl Viewer {
         self.rules.pending_rule = Some(rule);
         self.rules.hits = None;
         self.rules.hits_filter = filter;
+        self.rules.collect_started = Some(Instant::now());
         self.rules.generation += 1;
         let generation = self.rules.generation;
         let delimiter = self.delimiter;
@@ -1023,13 +1043,17 @@ impl Viewer {
                 }
                 let keep: HashSet<usize> = self.rule_columns(rule).iter().copied().collect();
                 self.muted = (0..self.headers.len())
-                    .filter(|column| !keep.contains(column))
+                    .filter(|column| !keep.contains(column) && !self.locked.contains(column))
                     .collect();
                 return;
             }
         }
         if let Some(saved) = self.rules.saved_muted.take() {
-            self.muted = saved;
+            // A column locked while the mode was on must stay visible.
+            self.muted = saved
+                .into_iter()
+                .filter(|column| !self.locked.contains(column))
+                .collect();
         }
     }
 
@@ -1045,8 +1069,7 @@ impl Viewer {
             for (hit, row) in hits.hits.iter().zip(hits.rows.iter()) {
                 let keep = match filter {
                     None => true,
-                    Some(true) => hit.passed,
-                    Some(false) => !hit.passed,
+                    Some(outcome) => hit.outcome == outcome,
                 };
                 if keep {
                     rows.push(row.clone());
@@ -1215,6 +1238,10 @@ impl Viewer {
                 iced::clipboard::write(value)
             }
             Message::Mute(index) => {
+                // A pinned column is always visible, so hiding it is ignored.
+                if self.locked.contains(&index) {
+                    return Task::none();
+                }
                 self.muted.insert(index);
                 self.profile_status = None;
                 self.rescan_if_searching_visible()
@@ -1230,8 +1257,23 @@ impl Viewer {
                 self.rescan_if_searching_visible()
             }
             Message::MuteAll => {
-                self.muted = (0..self.headers.len()).collect();
+                // Pinned columns stay visible even when everything else is
+                // hidden.
+                self.muted = (0..self.headers.len())
+                    .filter(|column| !self.locked.contains(column))
+                    .collect();
                 self.profile_status = None;
+                self.rescan_if_searching_visible()
+            }
+            Message::ToggleLock(index) => {
+                if self.locked.remove(&index) {
+                    // Unlocking keeps the column visible; the eye icon hides it.
+                } else {
+                    self.locked.insert(index);
+                    self.muted.remove(&index);
+                }
+                self.profile_status = None;
+                self.sync_rule_attrs();
                 self.rescan_if_searching_visible()
             }
             Message::ToggleHidden => {
@@ -1328,8 +1370,8 @@ impl Viewer {
                 Task::none()
             }
             Message::RuleAllRows(rule) => self.show_rule_rows(rule, None),
-            Message::RuleFilterRows(rule, passed) => {
-                self.show_rule_rows(rule, Some(passed))
+            Message::RuleFilterRows(rule, outcome) => {
+                self.show_rule_rows(rule, Some(outcome))
             }
             Message::RuleRowsCollected(generation, _rule, result) => {
                 if generation != self.rules.generation {
@@ -1337,6 +1379,8 @@ impl Viewer {
                 }
                 self.rules.collecting = false;
                 self.rules.pending_rule = None;
+                self.rules.collect_duration =
+                    self.rules.collect_started.take().map(|start| start.elapsed());
                 match result {
                     Ok(hits) => {
                         self.rules.hits = Some(hits);
@@ -1669,16 +1713,25 @@ impl Viewer {
         } else if let Some(active) = self.active_rule() {
             let label = match self.rules.hits_filter {
                 None => "all rows",
-                Some(true) => "matching rows",
-                Some(false) => "failing rows",
+                Some(RowOutcome::Passed) => "matching rows",
+                Some(RowOutcome::Failed) => "failing rows",
+                Some(RowOutcome::Skipped) => "skipped rows",
+                Some(RowOutcome::ValidationSkipped) => "validation-skipped rows",
             };
+            // How long the rows took to extract, next to the rule view like the
+            // duration on a regular search's status line.
+            let elapsed = self
+                .rules
+                .collect_duration
+                .map(|duration| format!(" · {}", format_duration(duration)))
+                .unwrap_or_default();
             row![
                 text(char::from(Bootstrap::ClipboardCheck))
                     .font(BOOTSTRAP_FONT)
                     .size(13)
                     .color(palette.primary.base.color),
                 text(format!(
-                    "rule {} · {label} ({})",
+                    "rule {} · {label} ({}){elapsed}",
                     active + 1,
                     self.rows.len()
                 ))
@@ -1704,13 +1757,20 @@ impl Viewer {
             .align_y(Center)
             .into()
         } else {
+            // A rule view reports how long its rows took to collect, just like
+            // a scan reports its own duration.
+            let elapsed = if self.active_rule().is_some() {
+                self.rules.collect_duration
+            } else {
+                self.scan_duration
+            };
             text(status_text(
                 self.rows.len(),
                 self.matched,
                 self.rows_read,
                 self.truncated,
                 self.indexed_result,
-                self.scan_duration,
+                elapsed,
             ))
             .size(13)
             .color(muted_text(&theme))
@@ -2119,27 +2179,47 @@ impl Viewer {
             if show_table {
                 let mut header_line = Row::new().spacing(0);
                 for (column_position, &column) in visible_columns.iter().enumerate() {
-                    // The header itself is inert now: the database and mute
-                    // icons mirror the controls on the chip view.
+                    // The header itself is inert now: the database, mute and
+                    // lock icons mirror the controls on the chip view.
                     let indexed = self.indexes.contains_key(&column);
+                    let locked = self.locked.contains(&column);
                     let database = if indexed {
                         Bootstrap::DatabaseFill
                     } else {
                         Bootstrap::Database
                     };
-                    let cell = row![
+                    let lock_icon = if locked {
+                        Bootstrap::LockFill
+                    } else {
+                        Bootstrap::Unlock
+                    };
+                    let mut cell = row![
                         text(self.header(column)).size(13).width(Fill),
                         button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
                             .on_press(Message::ToggleIndex(column))
                             .padding(2)
                             .style(ghost_button),
-                        button(text(char::from(Bootstrap::EyeSlash)).font(BOOTSTRAP_FONT).size(14))
-                            .on_press(Message::Mute(column))
-                            .padding(2)
-                            .style(ghost_button),
                     ]
                     .spacing(4)
                     .align_y(Center);
+                    if !locked {
+                        cell = cell.push(
+                            button(
+                                text(char::from(Bootstrap::EyeSlash))
+                                    .font(BOOTSTRAP_FONT)
+                                    .size(14),
+                            )
+                            .on_press(Message::Mute(column))
+                            .padding(2)
+                            .style(ghost_button),
+                        );
+                    }
+                    cell = cell.push(
+                        button(text(char::from(lock_icon)).font(BOOTSTRAP_FONT).size(14))
+                            .on_press(Message::ToggleLock(column))
+                            .padding(2)
+                            .style(ghost_button),
+                    );
                     header_line = header_line.push(
                         container(cell)
                             .width(Length::Fixed(column_widths[column_position]))
@@ -2204,6 +2284,7 @@ impl Viewer {
                         let header = self.header(column);
                         let highlight = attr_matches(&self.attribute_filter, header);
                         let indexed = self.indexes.contains_key(&column);
+                        let locked = self.locked.contains(&column);
                         line = line.push(chip(
                             header,
                             &values[column],
@@ -2212,6 +2293,7 @@ impl Viewer {
                             chip_max,
                             highlight,
                             indexed,
+                            locked,
                             self.show_attr_names,
                         ));
                     }
@@ -2340,8 +2422,8 @@ impl Viewer {
     }
 
     /// The rule-evaluation panel: pick/relaunch a rule file, then browse the
-    /// per-rule matching and failing rows. Clicking a rule loads its complete
-    /// pass/fail list; clicking an id opens that row.
+    /// per-rule rows (all outcomes). Clicking a rule loads its complete
+    /// row list; clicking an outcome count filters it.
     fn rules_sidebar(&self) -> Element<'_, Message> {
         let theme = self.theme();
         let palette = theme.extended_palette();
@@ -2525,18 +2607,30 @@ impl Viewer {
         .width(Fill)
         .style(ghost_button);
 
-        let passed_button = button(text(format!("passed {}", rule.rows_passed)).size(12))
-            .on_press(Message::RuleFilterRows(index, true))
-            .padding([2, 10])
-            .style(move |theme, status| {
-                filter_button_style(theme, status, filter == Some(true), true)
-            });
-        let failed_button = button(text(format!("failed {}", rule.rows_failed)).size(12))
-            .on_press(Message::RuleFilterRows(index, false))
-            .padding([2, 10])
-            .style(move |theme, status| {
-                filter_button_style(theme, status, filter == Some(false), false)
-            });
+        let passed_button = outcome_button(
+            index,
+            RowOutcome::Passed,
+            format!("passed {}", rule.rows_passed),
+            filter,
+        );
+        let failed_button = outcome_button(
+            index,
+            RowOutcome::Failed,
+            format!("failed {}", rule.rows_failed),
+            filter,
+        );
+        let skipped_button = outcome_button(
+            index,
+            RowOutcome::Skipped,
+            format!("skipped {}", rule.rows_skipped),
+            filter,
+        );
+        let validation_skipped_button = outcome_button(
+            index,
+            RowOutcome::ValidationSkipped,
+            format!("validation skipped {}", rule.rows_validation_skipped),
+            filter,
+        );
 
         // Statistics go on their own line: a long rule name in the narrow
         // sidebar must never squeeze them into one letter per line.
@@ -2546,15 +2640,8 @@ impl Viewer {
                 .color(muted_text(theme)),
             passed_button,
             failed_button,
-            text(format!("skipped {}", rule.rows_skipped))
-                .size(12)
-                .color(muted_text(theme)),
-            text(format!(
-                "validation skipped {}",
-                rule.rows_validation_skipped
-            ))
-            .size(12)
-            .color(muted_text(theme)),
+            skipped_button,
+            validation_skipped_button,
             container(text(status).size(11))
                 .padding([2, 8])
                 .style(move |theme: &Theme| status_badge_style(theme, status)),
@@ -2568,8 +2655,10 @@ impl Viewer {
         if active {
             let label = match filter {
                 None => "all rows",
-                Some(true) => "matching rows",
-                Some(false) => "failing rows",
+                Some(RowOutcome::Passed) => "matching rows",
+                Some(RowOutcome::Failed) => "failing rows",
+                Some(RowOutcome::Skipped) => "skipped rows",
+                Some(RowOutcome::ValidationSkipped) => "validation-skipped rows",
             };
             card = card.push(
                 row![
@@ -3082,9 +3171,10 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
     }
 }
 
-/// A single chip with an index toggle and a mute icon. `show_name` renders
-/// `attribute = value` instead of the value alone; the tooltip always shows the
-/// full label, and a click copies the value (a double click opens the row form).
+/// A single chip with an index toggle, a mute icon and a lock icon. `show_name`
+/// renders `attribute = value` instead of the value alone; the tooltip always
+/// shows the full label, and a click copies the value (a double click opens the
+/// row form). A locked chip shows a filled lock instead of the hide icon.
 fn chip<'a>(
     header: &'a str,
     value: &'a str,
@@ -3093,6 +3183,7 @@ fn chip<'a>(
     max_width: f32,
     highlight: bool,
     indexed: bool,
+    locked: bool,
     show_name: bool,
 ) -> Element<'a, Message> {
     let full_label = format!("{header} = {value}");
@@ -3127,10 +3218,28 @@ fn chip<'a>(
         .padding(2)
         .style(ghost_button);
 
-    // Clicking the chip (anywhere but the two icons, which capture their own
+    // A locked column is pinned visible: the filled lock reflects that and the
+    // hide icon is dropped, since hiding it is ignored anyway.
+    let lock_icon = if locked {
+        Bootstrap::LockFill
+    } else {
+        Bootstrap::Unlock
+    };
+    let lock = button(text(char::from(lock_icon)).font(BOOTSTRAP_FONT).size(14))
+        .on_press(Message::ToggleLock(column))
+        .padding(2)
+        .style(ghost_button);
+
+    let mut icons = row![label, toggle_index].spacing(6).align_y(Center);
+    if !locked {
+        icons = icons.push(mute);
+    }
+    icons = icons.push(lock);
+
+    // Clicking the chip (anywhere but the icons, which capture their own
     // events) copies the cell value to the clipboard.
     let chip = button(
-        container(row![label, toggle_index, mute].spacing(6).align_y(Center))
+        container(icons)
             .padding([3, 8])
             .style(move |theme| chip_style(theme, highlight, indexed)),
     )
@@ -3246,7 +3355,7 @@ fn collect_row(record: &ByteRecord) -> Vec<String> {
 }
 
 /// Compile a rules file and evaluate it against the open CSV. `collect_hits`
-/// selects a rule whose *every* pass/fail row should be retained (the
+/// selects a rule whose *every* row should be retained (the
 /// "show all rows" action); `None` keeps only the bounded sample.
 fn evaluate_rules(
     csv: PathBuf,
@@ -3302,8 +3411,10 @@ fn collect_rule_hits(
         .ok_or_else(|| format!("rule {} not found", rule + 1))
 }
 
-/// Collect one rule's complete pass/fail list *and* the full CSV record for
-/// each hit, so the main grid can render the rows with all their attributes.
+/// Collect one rule's complete row list *and* the full CSV record for each hit,
+/// so the main grid can render the rows with all their attributes.
+/// The engine captured each hit's row in the same parallel validation pass, so
+/// no second read of the file is needed here.
 fn load_rule_rows(
     csv: PathBuf,
     delimiter: u8,
@@ -3311,65 +3422,12 @@ fn load_rule_rows(
     id_column: String,
     rule: usize,
 ) -> Result<RuleHits, String> {
-    let hits = collect_rule_hits(csv.clone(), delimiter, rules_path, id_column.clone(), rule)?;
-    let id_idx = if id_column.trim().is_empty() {
-        None
-    } else {
-        let headers = engine::read_headers(&csv, delimiter)?;
-        ColumnResolver::resolve(&id_column, &headers)
-    };
-    let wanted: HashSet<&str> = hits.iter().map(|hit| hit.id.as_str()).collect();
-    let by_id = rows_by_id(&csv, delimiter, id_idx, &wanted)?;
+    let mut hits = collect_rule_hits(csv, delimiter, rules_path, id_column, rule)?;
     let rows = hits
-        .iter()
-        .map(|hit| by_id.get(hit.id.as_str()).cloned().unwrap_or_default())
+        .iter_mut()
+        .map(|hit| std::mem::take(&mut hit.cells))
         .collect();
     Ok(RuleHits { rule, hits, rows })
-}
-
-/// Single pass over the file collecting the full row for each wanted id. Ids
-/// come from the engine, so this mirrors its `row:N` fallback for files without
-/// an id column.
-fn rows_by_id(
-    path: &Path,
-    delimiter: u8,
-    id_idx: Option<usize>,
-    wanted: &HashSet<&str>,
-) -> Result<HashMap<String, Vec<String>>, String> {
-    let mut found: HashMap<String, Vec<String>> = HashMap::new();
-    if wanted.is_empty() {
-        return Ok(found);
-    }
-    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
-    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
-    builder.delimiter(delimiter).has_headers(true).flexible(true);
-    let mut reader = builder.from_reader(file);
-    let mut record = ByteRecord::new();
-    let mut row = 0u64;
-    loop {
-        match reader.read_byte_record(&mut record) {
-            Ok(false) => break,
-            Ok(true) => {}
-            Err(e) => return Err(format!("error reading CSV: {e}")),
-        }
-        row += 1;
-        let id = match id_idx {
-            Some(column) => record
-                .get(column)
-                .map(|cell| String::from_utf8_lossy(cell).trim().to_string())
-                .unwrap_or_default(),
-            None => format!("row:{row}"),
-        };
-        if wanted.contains(id.as_str()) {
-            if !found.contains_key(&id) {
-                found.insert(id.clone(), collect_row(&record));
-            }
-            if found.len() == wanted.len() {
-                break;
-            }
-        }
-    }
-    Ok(found)
 }
 
 /// Stream the whole file, count every match and keep the first `limit` rows.
@@ -3701,20 +3759,17 @@ fn status_badge_style(theme: &Theme, status: &str) -> container::Style {
     }
 }
 
-/// A clickable `passed N` / `failed N` count. When `active`, the chip is tinted
-/// and outlined in the side's colour so the current filter is obvious.
+/// A clickable outcome count (`passed N`, `failed N`, …). When `active`, the
+/// chip is tinted and outlined in the outcome's colour so the current filter is
+/// obvious.
 fn filter_button_style(
     theme: &Theme,
     status: button::Status,
     active: bool,
-    passed: bool,
+    outcome: RowOutcome,
 ) -> button::Style {
     let palette = theme.extended_palette();
-    let (weak, strong) = if passed {
-        (palette.success.weak.color, palette.success.strong.color)
-    } else {
-        (palette.danger.weak.color, palette.danger.strong.color)
-    };
+    let (weak, strong) = outcome_colors(theme, outcome);
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
         background: if active {
@@ -3740,6 +3795,39 @@ fn filter_button_style(
         },
         shadow: Shadow::default(),
     }
+}
+
+/// The weak (fill) and strong (text/border) colours for a row outcome.
+fn outcome_colors(theme: &Theme, outcome: RowOutcome) -> (Color, Color) {
+    let palette = theme.extended_palette();
+    match outcome {
+        RowOutcome::Passed => (palette.success.weak.color, palette.success.strong.color),
+        RowOutcome::Failed => (palette.danger.weak.color, palette.danger.strong.color),
+        RowOutcome::Skipped => (
+            palette.secondary.weak.color,
+            palette.secondary.strong.color,
+        ),
+        RowOutcome::ValidationSkipped => (
+            palette.primary.weak.color,
+            palette.primary.strong.color,
+        ),
+    }
+}
+
+/// One outcome filter chip for the rules panel.
+fn outcome_button<'a>(
+    index: usize,
+    outcome: RowOutcome,
+    label: String,
+    active: Option<RowOutcome>,
+) -> Element<'a, Message> {
+    button(text(label).size(12))
+        .on_press(Message::RuleFilterRows(index, outcome))
+        .padding([2, 10])
+        .style(move |theme, status| {
+            filter_button_style(theme, status, active == Some(outcome), outcome)
+        })
+        .into()
 }
 
 /// Surface of one rule card inside the panel: a hairline box that separates
@@ -4062,32 +4150,87 @@ mod tests {
     }
 
     #[test]
-    fn rows_by_id_collects_full_records() {
+    fn rule_view_can_render_full_rows_from_engine() {
+        // The engine captures each hit's full row in the same parallel pass, so
+        // the GUI's rule view no longer reads the file a second time. This
+        // checks the captured cells line up with the Hit's identity.
         let dir = std::env::temp_dir().join(format!("fview-rows-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("data.csv");
         std::fs::write(&path, "id,name\n1,Alice\n2,Bob\n3,Cara\n").unwrap();
 
-        let wanted: HashSet<&str> = ["1", "3"].into_iter().collect();
-        let found = rows_by_id(&path, b',', Some(0), &wanted).unwrap();
-        assert_eq!(found["1"], vec!["1".to_string(), "Alice".to_string()]);
-        assert_eq!(found["3"], vec!["3".to_string(), "Cara".to_string()]);
-        assert!(!found.contains_key("2"));
+        let rules_path = dir.join("r.vl");
+        std::fs::write(
+            &rules_path,
+            "rule \"name exists\" {\n  left = id\n  right = name\n  mapping = none\n}\n",
+        )
+        .unwrap();
+        let hits = collect_rule_hits(path, b',', rules_path, "id".into(), 0).unwrap();
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[0].cells, vec!["1".to_string(), "Alice".to_string()]);
+        assert_eq!(hits[2].cells, vec!["3".to_string(), "Cara".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A minimal viewer with three headers and no file, for testing the
+    /// attribute visibility state machine.
+    fn test_viewer() -> Viewer {
+        let (mut viewer, _task) = Viewer::new(Args {
+            path: None,
+            delimiter: ",".into(),
+            case_sensitive: false,
+            limit: 100,
+            backend: Backend::TinySkia,
+        });
+        viewer.headers = vec!["a".into(), "b".into(), "c".into()];
+        viewer
+    }
+
     #[test]
-    fn rows_by_id_uses_row_numbers_without_id_column() {
-        let dir = std::env::temp_dir().join(format!("fview-rows-noid-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("data.csv");
-        std::fs::write(&path, "name\nAlice\nBob\n").unwrap();
+    fn locked_columns_survive_mute_all() {
+        let mut viewer = test_viewer();
+        viewer.locked.insert(1);
 
-        let wanted: HashSet<&str> = ["row:2"].into_iter().collect();
-        let found = rows_by_id(&path, b',', None, &wanted).unwrap();
-        assert_eq!(found["row:2"], vec!["Bob".to_string()]);
+        let _ = viewer.update(Message::MuteAll);
+        assert!(!viewer.muted.contains(&1), "a locked column stays visible");
+        assert!(viewer.muted.contains(&0));
+        assert!(viewer.muted.contains(&2));
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // Hiding a locked column directly is ignored too.
+        let _ = viewer.update(Message::Mute(1));
+        assert!(!viewer.muted.contains(&1));
+
+        // Unlocking keeps it visible; hiding it is a separate action.
+        let _ = viewer.update(Message::ToggleLock(1));
+        assert!(!viewer.locked.contains(&1));
+        assert!(!viewer.muted.contains(&1));
+    }
+
+    #[test]
+    fn locked_columns_survive_profiles_and_rule_attrs() {
+        let mut viewer = test_viewer();
+        viewer.locked.insert(1);
+        viewer.profiles.insert(
+            "p".into(),
+            ProfileConfig {
+                visible: vec!["a".into(), "c".into()],
+            },
+        );
+
+        // The profile only lists a and c, but b is locked so it stays visible.
+        viewer.apply_profile("p");
+        assert!(viewer.muted.is_empty());
+
+        // "rule attributes only" keeps the locked column as well.
+        viewer.rules.attrs_only = true;
+        viewer.rules.hits = Some(RuleHits {
+            rule: 0,
+            hits: Vec::new(),
+            rows: Vec::new(),
+        });
+        viewer.rules.view_active = true;
+        viewer.sync_rule_attrs();
+        assert!(!viewer.muted.contains(&1));
     }
 }

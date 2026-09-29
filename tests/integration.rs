@@ -184,6 +184,95 @@ fn composite_keys_use_two_input_values() {
     assert_eq!(auto["rows_failed"], 2);
 }
 
+/// Several `mapping_right` columns list acceptable target values: the row
+/// passes when its target matches any one of them (not just the first
+/// non-empty column).
+#[test]
+fn cascading_mapping_accepts_any_target_column() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-cascade-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let ref_path = dir.join("ref.csv");
+    let rules_path = dir.join("r.vl");
+    std::fs::write(&csv_path, "id,otype,subtype,cls\n1,A,B,SUB\n2,A,B,CLS\n3,A,B,DOC\n4,A,B,NOPE\n")
+        .unwrap();
+    std::fs::write(
+        &ref_path,
+        "otype,subtype,doctype,veeva_subtype,classification\nA,B,DOC,SUB,CLS\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rules_path,
+        format!(
+            "rule \"cascade\" {{\n  left = [otype, subtype]\n  right = cls\n  mapping_files = [\"{}\"]\n  mapping_left = [otype, subtype]\n  mapping_right = [\"doctype\", \"veeva_subtype\", \"classification\"]\n}}\n",
+            ref_path.display()
+        ),
+    )
+    .unwrap();
+
+    let report = run_json(&[
+        &csv_path.display().to_string(),
+        "-r",
+        &rules_path.display().to_string(),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    let rule = &report["rules"].as_array().unwrap()[0];
+    // SUB, CLS and DOC are all acceptable; only NOPE fails.
+    assert_eq!(rule["rows_passed"], 3);
+    assert_eq!(rule["rows_failed"], 1);
+    // The candidates are alternatives, not conflicting observations.
+    assert_eq!(rule["mapping"]["ambiguous_inputs"], 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// When the rule's `right` is a list of columns, the reference
+/// `mapping_right` columns form a composite value to match.
+#[test]
+fn composite_right_matches_reference_columns_as_a_whole() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-compright-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let ref_path = dir.join("ref.csv");
+    let rules_path = dir.join("r.vl");
+    std::fs::write(
+        &csv_path,
+        "id,otype,subtype,dtype,dsub\n1,A,B,DOC,SUB\n2,A,B,DOC,WRONG\n",
+    )
+    .unwrap();
+    std::fs::write(&ref_path, "otype,subtype,doctype,sub_ref\nA,B,DOC,SUB\n").unwrap();
+    std::fs::write(
+        &rules_path,
+        format!(
+            "rule \"composite\" {{\n  left = [otype, subtype]\n  right = [dtype, dsub]\n  mapping_files = [\"{}\"]\n  mapping_left = [otype, subtype]\n  mapping_right = [\"doctype\", \"sub_ref\"]\n}}\n",
+            ref_path.display()
+        ),
+    )
+    .unwrap();
+
+    let report = run_json(&[
+        &csv_path.display().to_string(),
+        "-r",
+        &rules_path.display().to_string(),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    let rule = &report["rules"].as_array().unwrap()[0];
+    assert_eq!(rule["rows_passed"], 1);
+    assert_eq!(rule["rows_failed"], 1);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn html_report_is_self_contained() {
     let rules = people_rules();
@@ -566,8 +655,8 @@ fn engine_collects_all_hits_and_rule_columns() {
 
     // Every checked row is retained, split between pass and fail.
     assert_eq!(rule.hits.len() as u64, rule.rows_checked);
-    let passed = rule.hits.iter().filter(|hit| hit.passed).count() as u64;
-    let failed = rule.hits.iter().filter(|hit| !hit.passed).count() as u64;
+    let passed = rule.hits.iter().filter(|hit| hit.passed()).count() as u64;
+    let failed = rule.hits.iter().filter(|hit| !hit.passed()).count() as u64;
     assert_eq!(passed, rule.rows_passed);
     assert_eq!(failed, rule.rows_failed);
 
@@ -575,7 +664,7 @@ fn engine_collects_all_hits_and_rule_columns() {
     let failed_ids: Vec<&str> = rule
         .hits
         .iter()
-        .filter(|hit| !hit.passed)
+        .filter(|hit| !hit.passed())
         .map(|hit| hit.id.as_str())
         .collect();
     assert!(failed_ids.contains(&"4"));
@@ -590,6 +679,71 @@ fn engine_collects_all_hits_and_rule_columns() {
     )
     .unwrap();
     assert!(plain.rules[0].hits.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `collect_hits` must retain skipped and validation-skipped rows too, so the
+/// GUI can browse the rows behind every statistic, not only passes/failures.
+#[test]
+fn engine_collects_skipped_and_validation_skipped_hits() {
+    use fast_csv::engine::{self, EngineConfig};
+    use fast_csv::report::RowOutcome;
+    use fast_csv::{dsl, rules};
+
+    let dir = std::env::temp_dir().join(format!("fvalidate-skip-hits-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let rules_path = dir.join("rules.vl");
+
+    std::fs::write(
+        &csv_path,
+        "id,a,b,status\n1,FR,FR,ok\n2,FR,FR,archived\n3,,,ok\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rules_path,
+        "rule \"r\" {\n  left = a\n  right = b\n  allow_empty = true\n  validation_skipped = in(status, [\"archived\"])\n}\n",
+    )
+    .unwrap();
+
+    let headers = engine::read_headers(&csv_path, b',').unwrap();
+    let program = dsl::load_file(&rules_path).unwrap();
+    let plan = rules::compile(program, &headers).unwrap();
+    let report = engine::run(
+        &plan,
+        &EngineConfig {
+            path: csv_path.clone(),
+            delimiter: b',',
+            threads: 1,
+            id_idx: Some(0),
+            progress: None,
+            collect_hits: Some(0),
+        },
+    )
+    .unwrap();
+
+    let rule = &report.rules[0];
+    assert_eq!(rule.rows_passed, 1);
+    assert_eq!(rule.rows_skipped, 1);
+    assert_eq!(rule.rows_validation_skipped, 1);
+    assert_eq!(rule.hits.len(), 3);
+
+    let count = |outcome: RowOutcome| {
+        rule.hits.iter().filter(|hit| hit.outcome == outcome).count()
+    };
+    assert_eq!(count(RowOutcome::Passed), 1);
+    assert_eq!(count(RowOutcome::Skipped), 1);
+    assert_eq!(count(RowOutcome::ValidationSkipped), 1);
+    assert_eq!(count(RowOutcome::Failed), 0);
+
+    // The full CSV row travels with every hit, regardless of outcome.
+    let skipped = rule
+        .hits
+        .iter()
+        .find(|hit| hit.outcome == RowOutcome::Skipped)
+        .unwrap();
+    assert_eq!(skipped.cells, vec!["3".to_string(), String::new(), String::new(), "ok".to_string()]);
 
     std::fs::remove_dir_all(&dir).ok();
 }

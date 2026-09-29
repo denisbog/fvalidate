@@ -150,7 +150,7 @@ several lines as long as brackets/quotes balance.
 | `mapping_filter` | A predicate selecting which rows **define a mapping**. For `mapping = auto` it runs over the data rows; for `mapping_files` it runs over the reference rows (columns resolved against each file's header). It never skips validation. |
 | `mapping` | `none` (default) or `auto` (extract from the data). |
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
-| `mapping_left`, `mapping_right` | Column(s) inside the reference files. `mapping_left` lists form a composite key; several `mapping_right` columns form a priority list (first non-empty, scanning right to left). |
+| `mapping_left`, `mapping_right` | Column(s) inside the reference files. `mapping_left` lists form a composite key; several `mapping_right` columns list acceptable targets (the row matches if its right side equals any of them). |
 | `mapping_multi`, `mapping_separator` | Multi-value handling inside reference files. |
 | `report_limit` | Overrides `-n` for this rule. |
 
@@ -221,11 +221,13 @@ order. Expressions are parsed once and evaluated per row.
 ### Cascading reference values
 
 When the expected value can come from one of several reference columns, list
-them in `mapping_right`. The target is the **first non-empty** value scanning
-the list from right to left, so the list reads as a priority chain:
+them in `mapping_right`. Every non-empty column is an **acceptable target**: a
+row passes when its right side matches **any** of them. This also works when
+`right` itself is a list of columns.
 
 ```text
-# Classification, else Veeva Subtype, else Veeva DocType.
+# The right value may match the Veeva DocType, the Veeva Subtype or the
+# Classification, whichever the reference row provides.
 rule "classification__v from classification-mapping.csv" {
   derive          = 'if(is_template == "T", "T", "") as template_key'
   left            = [r_object_type, subtype_code, doc_subtype, category, template_key]
@@ -237,7 +239,10 @@ rule "classification__v from classification-mapping.csv" {
 }
 ```
 
-A single `mapping_right` column keeps the plain behaviour.
+A single `mapping_right` column keeps the plain behaviour: the canonical
+(most frequent) target is used and differing targets are reported as ambiguous.
+With several `mapping_right` columns the targets are alternatives, so the key
+is not reported as ambiguous.
 
 ### Transforms
 
@@ -507,16 +512,22 @@ docks a vertical rule panel on the left:
   is currently open. An **id column** box names the column whose values identify
   rows (leave it empty to use row numbers).
 * The panel shows only the per-rule **statistics** (status and
-  `checked / passed / failed`); the rows themselves are never listed there.
-* Clicking the **rule name** redirects the **main grid** to every matching and
-  failing row of that rule (not just a sample), so the usual chip/table view and
-  its attribute/profiler controls apply to those rows. Clicking the **passed**
-  or **failed** count shows only that side; the active count turns into a
-  **clear** action, and searching returns the grid to the normal scan.
+  `checked / passed / failed / skipped / validation skipped`); the rows
+  themselves are never listed there.
+* Clicking the **rule name** redirects the **main grid** to every row of that
+  rule (not just a sample), so the usual chip/table view and its
+  attribute/profiler controls apply to those rows. Clicking the **passed**,
+  **failed**, **skipped** or **validation skipped** count shows only that
+  outcome; the active count turns into a **clear** action, and searching returns
+  the grid to the normal scan.
 * The **rule attributes only** checkbox hides every column the active rule does
   not read from the main grid (and from the row detail form), so a wide file
   collapses to just the attributes that matter; turning it off restores the
   previous attribute set.
+* Every attribute chip (and each table header) carries a **lock** icon. A locked
+  column is pinned visible: **Hide all**, the hide eye, saved profiles and
+  "rule attributes only" all leave it in the grid. Click the filled lock to
+  release it (unlocking keeps the column visible; hide it with the eye).
 * A **rows** drop-down sets how many matching rows the grid keeps (100 by
   default, up to 10 000); changing it re-runs the search.
 

@@ -35,11 +35,23 @@ pub struct Mapping {
     pub targets: HashMap<Box<str>, Vec<(Box<str>, u64)>>,
     /// Canonical target for each left value.
     pub canonical: HashMap<Box<str>, Box<str>>,
+    /// True when the relation was built from several `mapping_right` columns.
+    /// Every stored target is then an *acceptable* value (a union) instead of
+    /// an ambiguous observation made by different rows.
+    pub multi_target: bool,
 }
 
 impl Mapping {
     /// Build a mapping from raw observation counts.
     pub fn from_counts(counts: MapCounts, origin: MappingOrigin) -> Self {
+        Self::from_counts_with_targets(counts, origin, false)
+    }
+
+    fn from_counts_with_targets(
+        counts: MapCounts,
+        origin: MappingOrigin,
+        multi_target: bool,
+    ) -> Self {
         let mut targets: HashMap<Box<str>, Vec<(Box<str>, u64)>> =
             HashMap::with_capacity(counts.len());
         let mut canonical: HashMap<Box<str>, Box<str>> = HashMap::with_capacity(counts.len());
@@ -56,6 +68,7 @@ impl Mapping {
             origin,
             targets,
             canonical,
+            multi_target,
         }
     }
 
@@ -67,8 +80,15 @@ impl Mapping {
         self.canonical.get(key).map(|s| s.as_ref())
     }
 
+    /// Every acceptable target for a key. For a plain mapping this is the
+    /// observed relation (one canonical target is used unless it is
+    /// ambiguous); for a multi-target mapping all of them are accepted.
+    pub fn targets_for(&self, key: &str) -> &[(Box<str>, u64)] {
+        self.targets.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     pub fn is_ambiguous(&self, key: &str) -> bool {
-        self.targets.get(key).is_some_and(|t| t.len() > 1)
+        !self.multi_target && self.targets.get(key).is_some_and(|t| t.len() > 1)
     }
 
     pub fn len(&self) -> usize {
@@ -76,6 +96,9 @@ impl Mapping {
     }
 
     pub fn ambiguous_count(&self) -> usize {
+        if self.multi_target {
+            return 0;
+        }
         self.targets.values().filter(|t| t.len() > 1).count()
     }
 }
@@ -177,6 +200,10 @@ pub struct FileMappingSpec<'a> {
     pub join_separator: &'a str,
     pub trim: bool,
     pub delimiter: u8,
+    /// True when the rule's `right` side is itself a list of columns. The
+    /// `mapping_right` columns then form a composite value (joined with
+    /// `join_separator`) instead of a list of alternative targets.
+    pub right_composite: bool,
     /// Optional predicate over reference rows; only matching rows define the
     /// mapping. Column names are resolved against each file's own header.
     pub filter: Option<&'a Predicate>,
@@ -273,13 +300,16 @@ impl MappingCache {
                     &mut part_buf,
                     &mut left_key,
                 );
-                // Several `mapping_right` columns form a priority list instead
-                // of a composite value: the first non-empty one, scanning right
-                // to left, becomes the target. A single column keeps the
-                // existing behaviour.
-                if right_idx.len() > 1 {
-                    right_key.clear();
-                    for &i in right_idx.iter().rev() {
+                // Several `mapping_right` columns list alternative acceptable
+                // values: every non-empty one becomes a candidate target for
+                // the key (a union), so the row passes when *any* of them
+                // matches the right side. When the rule's `right` is itself a
+                // list of columns the mapping columns form a composite value
+                // instead. A single column keeps the plain
+                // relation/canonical behaviour.
+                let left_tokens = split_tokens(&left_key, spec.multi, spec.value_separator);
+                if right_idx.len() > 1 && !spec.right_composite {
+                    for &i in &right_idx {
                         let raw = row.get(i).map(String::as_str).unwrap_or("");
                         let cell = if spec.trim { raw.trim() } else { raw };
                         crate::transform::apply_pipeline(
@@ -288,9 +318,15 @@ impl MappingCache {
                             &mut right_scratch,
                             &mut part_buf,
                         );
-                        if !right_scratch.trim().is_empty() {
-                            right_key.push_str(&right_scratch);
-                            break;
+                        if right_scratch.trim().is_empty() {
+                            continue;
+                        }
+                        let right_tokens =
+                            split_tokens(&right_scratch, spec.multi, spec.value_separator);
+                        for l in &left_tokens {
+                            for r in &right_tokens {
+                                bump_counts(&mut counts, l, r);
+                            }
                         }
                     }
                 } else {
@@ -305,18 +341,20 @@ impl MappingCache {
                         &mut part_buf,
                         &mut right_key,
                     );
-                }
-
-                let left_tokens = split_tokens(&left_key, spec.multi, spec.value_separator);
-                let right_tokens = split_tokens(&right_key, spec.multi, spec.value_separator);
-
-                for (l, r) in pair_tokens(&left_tokens, &right_tokens) {
-                    bump_counts(&mut counts, l, r);
+                    let right_tokens =
+                        split_tokens(&right_key, spec.multi, spec.value_separator);
+                    for (l, r) in pair_tokens(&left_tokens, &right_tokens) {
+                        bump_counts(&mut counts, l, r);
+                    }
                 }
             }
         }
 
-        Ok(Mapping::from_counts(counts, MappingOrigin::File))
+        Ok(Mapping::from_counts_with_targets(
+            counts,
+            MappingOrigin::File,
+            spec.right_columns.len() > 1 && !spec.right_composite,
+        ))
     }
 }
 
@@ -392,6 +430,12 @@ fn mapping_signature(files: &[PathBuf], spec: &FileMappingSpec) -> String {
     out.push('\u{1f}');
     out.push_str(&spec.right_columns.join("\u{1e}"));
     out.push('\u{1f}');
+    out.push_str(if spec.right_composite {
+        "right=composite"
+    } else {
+        "right=single"
+    });
+    out.push('\u{1f}');
     for transform in spec.left_transforms {
         transform.signature(&mut out);
         out.push('\u{1e}');
@@ -436,6 +480,7 @@ mod tests {
             join_separator: "|",
             trim: false,
             delimiter: b',',
+            right_composite: false,
             filter,
         }
     }
@@ -495,5 +540,22 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &filtered));
         assert_eq!(filtered.expected("LEGACY"), Some("OLD"));
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn multi_targets_are_alternatives_not_ambiguities() {
+        let mut hits = HashMap::new();
+        hits.insert("DOC".into(), 1u64);
+        hits.insert("SUB".into(), 1u64);
+        let mut counts: MapCounts = HashMap::new();
+        counts.insert("A|B".into(), hits);
+
+        let mapping = Mapping::from_counts_with_targets(counts, MappingOrigin::File, true);
+        assert!(mapping.multi_target);
+        assert_eq!(mapping.targets_for("A|B").len(), 2);
+        // Several `mapping_right` columns are acceptable values, so the key is
+        // not reported as ambiguous.
+        assert!(!mapping.is_ambiguous("A|B"));
+        assert_eq!(mapping.ambiguous_count(), 0);
     }
 }
