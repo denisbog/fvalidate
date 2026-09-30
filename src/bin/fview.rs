@@ -238,7 +238,8 @@ struct RulesState {
 struct RuleHits {
     rule: usize,
     hits: Vec<RowHit>,
-    rows: Vec<Vec<String>>,
+    /// Shared with the grid: switching outcome clones the `Arc`s, not the rows.
+    rows: Vec<Arc<Vec<String>>>,
 }
 
 /// The row opened in the floating detail form.
@@ -413,7 +414,7 @@ fn chip_layout(width: f32, chip_width: f32) -> (usize, f32, usize) {
 /// earlier than necessary while still filling the row. Only the first rows are
 /// sampled so a large result set does not slow the view down.
 fn typical_chip_width(
-    rows: &[Vec<String>],
+    rows: &[Arc<Vec<String>>],
     visible_columns: &[usize],
     headers: &[String],
     show_names: bool,
@@ -575,7 +576,9 @@ struct Viewer {
     /// Whether the list of hidden attribute chips in the top bar is expanded.
     show_hidden: bool,
     filter: String,
-    rows: Vec<Vec<String>>,
+    /// The rows currently shown. Rows are shared (`Arc`) so a rule-view filter
+    /// switch re-uses the cached records instead of deep-copying them.
+    rows: Vec<Arc<Vec<String>>>,
     /// The row opened in the floating detail form.
     detail: Option<DetailState>,
     /// Attribute whose value was last copied from the detail form, so the form
@@ -1072,7 +1075,8 @@ impl Viewer {
                     Some(outcome) => hit.outcome == outcome,
                 };
                 if keep {
-                    rows.push(row.clone());
+                    // Share the cached record; only the pointer is cloned.
+                    rows.push(Arc::clone(row));
                 }
             }
             (rows, hits.hits.len())
@@ -1422,7 +1426,7 @@ impl Viewer {
                 }
                 match result {
                     Ok(scan) => {
-                        self.rows = scan.rows;
+                        self.rows = scan.rows.into_iter().map(Arc::new).collect();
                         self.matched = scan.matched;
                         self.truncated = scan.truncated;
                         self.rows_read = scan.rows_read;
@@ -3423,9 +3427,11 @@ fn load_rule_rows(
     rule: usize,
 ) -> Result<RuleHits, String> {
     let mut hits = collect_rule_hits(csv, delimiter, rules_path, id_column, rule)?;
+    // Keep each row behind an `Arc` so the grid can switch outcome without
+    // copying the record.
     let rows = hits
         .iter_mut()
-        .map(|hit| std::mem::take(&mut hit.cells))
+        .map(|hit| Arc::new(std::mem::take(&mut hit.cells)))
         .collect();
     Ok(RuleHits { rule, hits, rows })
 }
@@ -4185,6 +4191,31 @@ mod tests {
         });
         viewer.headers = vec!["a".into(), "b".into(), "c".into()];
         viewer
+    }
+
+    #[test]
+    fn rule_view_filtering_shares_rows_instead_of_copying() {
+        let mut viewer = test_viewer();
+        let row = Arc::new(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        viewer.rules.hits = Some(RuleHits {
+            rule: 0,
+            hits: vec![RowHit {
+                id: "1".into(),
+                row: None,
+                left: "a".into(),
+                right: "b".into(),
+                expected: None,
+                outcome: RowOutcome::Passed,
+                cells: Vec::new(),
+            }],
+            rows: vec![Arc::clone(&row)],
+        });
+        viewer.rules.hits_filter = Some(RowOutcome::Passed);
+        let _ = viewer.apply_rule_view();
+        assert_eq!(viewer.rows.len(), 1);
+        // Switching outcome re-uses the cached record: same allocation, so the
+        // filter click does not deep-copy every row.
+        assert!(Arc::ptr_eq(&viewer.rows[0], &row));
     }
 
     #[test]
