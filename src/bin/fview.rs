@@ -110,13 +110,19 @@ const CHIP_LINE_HEIGHT: f32 = 16.0;
 const MAX_CHIP_LINES: usize = 2;
 /// Vertical padding of a data stripe (kept in sync with `container.padding`).
 const STRIPE_PADDING: f32 = 8.0;
+/// Horizontal padding of a data stripe (kept in sync with `container.padding`).
+const STRIPE_PADDING_H: f32 = 12.0;
+/// Padding of the content area that holds the rules sidebar and the grid.
+const CONTENT_PADDING: f32 = 10.0;
+/// Gap between the docked rules sidebar and the grid.
+const MAIN_GAP: f32 = 8.0;
+/// Right padding of the row list. It keeps chips clear of the scrollbar iced
+/// draws over the scrollable's right edge.
+const LIST_RIGHT_PADDING: f32 = 14.0;
 /// Spacing between the chip lines inside a stripe.
 const CHIP_LINE_SPACING: f32 = 6.0;
 /// Rows rendered above and below the viewport so scrolling does not flash gaps.
 const OVERSCAN_ROWS: usize = 3;
-/// Preferred chip width used to decide how many chips fit on a line before any
-/// rows are known.
-const DEFAULT_CHIP_WIDTH: f32 = 220.0;
 /// Rough width of one character at size 13, used to decide text wrapping.
 const CHAR_WIDTH: f32 = 7.2;
 /// Corner radius shared by cards, inputs and buttons.
@@ -393,60 +399,72 @@ fn format_duration(elapsed: Duration) -> String {
     }
 }
 
-/// Layout geometry derived from the window width and the width of a typical
-/// chip: chips per line, the maximum chip width, and how many hidden-attribute
-/// chips fit on a line.
-fn chip_layout(width: f32, chip_width: f32) -> (usize, f32, usize) {
-    let available = (width - 28.0).max(200.0);
-    let chip_width = chip_width.max(120.0);
-    let columns = (((available + CHIP_SPACING) / (chip_width + CHIP_SPACING)).floor() as usize)
-        .max(1)
-        .min(available as usize / 60);
-    let chip_max = ((available - (columns.saturating_sub(1) as f32) * CHIP_SPACING)
-        / columns as f32)
-        .max(120.0);
-    let hidden_columns = ((available / 210.0).floor() as usize).max(1);
-    (columns, chip_max, hidden_columns)
+/// Width of the docked rules sidebar for a given window, kept in sync with the
+/// container built by `rules_sidebar`.
+fn sidebar_width(window_width: f32) -> f32 {
+    (window_width * 0.30).clamp(260.0, 340.0)
 }
 
-/// Estimated width of the widest chip in the current window, used to decide how
-/// many chips fit on a line. Using the widest label keeps chips from wrapping
-/// earlier than necessary while still filling the row. Only the first rows are
-/// sampled so a large result set does not slow the view down.
-fn typical_chip_width(
-    rows: &[Arc<Vec<String>>],
-    visible_columns: &[usize],
-    headers: &[String],
-    show_names: bool,
-) -> f32 {
-    const SAMPLE_ROWS: usize = 16;
-    let header_chars = |column: usize| {
-        headers.get(column).map(String::as_str).unwrap_or("").chars().count()
-    };
-    let mut widest: f32 = 0.0;
-    for row in rows.iter().take(SAMPLE_ROWS) {
-        for &column in visible_columns {
-            let value_chars = row.get(column).map(String::as_str).unwrap_or("").chars().count();
-            let chars = if show_names {
-                header_chars(column) + 3 + value_chars
-            } else {
-                value_chars
-            };
-            widest = widest.max(chars as f32 * CHAR_WIDTH + CHIP_CHROME);
-        }
-    }
-    if show_names {
-        // A header alone must not be clipped either.
-        for &column in visible_columns {
-            widest = widest.max(header_chars(column) as f32 * CHAR_WIDTH + CHIP_CHROME);
-        }
-    }
-    // Before any rows are known, fall back to a sensible average chip.
-    if widest > 0.0 {
-        widest
+/// Width available to one line of chips: the grid minus the row list's right
+/// padding and the stripe's horizontal padding.
+fn chip_area_width(grid_width: f32) -> f32 {
+    (grid_width - LIST_RIGHT_PADDING - 2.0 * STRIPE_PADDING_H).max(200.0)
+}
+
+/// Estimated width of the chip holding `value`, labelled with `header` when the
+/// attribute names are shown. Mirrors `estimate_chip_width` without building
+/// the `"header = value"` string on every row of the height pass.
+fn chip_estimate(header: &str, value: &str, show_name: bool) -> f32 {
+    let chars = if show_name {
+        header.chars().count() + 3 + value.chars().count()
     } else {
-        DEFAULT_CHIP_WIDTH
+        value.chars().count()
+    };
+    chars as f32 * CHAR_WIDTH + CHIP_CHROME
+}
+
+/// Greedy first-fit: how many lines are needed to lay `widths` out within
+/// `available`, keeping `CHIP_SPACING` between neighbouring chips. A chip wider
+/// than the whole line counts as one line. Mirrored by `chip_lines`, which
+/// returns the actual ranges.
+fn chip_line_count(widths: impl Iterator<Item = f32>, available: f32) -> usize {
+    let mut lines = 1usize;
+    let mut used = 0.0f32;
+    let mut count = 0usize;
+    for width in widths {
+        let width = width.min(available);
+        if count > 0 && used + CHIP_SPACING + width > available {
+            lines += 1;
+            used = width;
+        } else {
+            used += if count > 0 { CHIP_SPACING } else { 0.0 } + width;
+        }
+        count += 1;
     }
+    lines
+}
+
+/// Greedy first-fit line ranges for `widths` within `available`. Uses the same
+/// packing as `chip_line_count` so the virtual-scroll heights match exactly
+/// what is rendered.
+fn chip_lines(widths: &[f32], available: f32) -> Vec<std::ops::Range<usize>> {
+    let mut lines = Vec::new();
+    let mut start = 0usize;
+    let mut used = 0.0f32;
+    for (index, &width) in widths.iter().enumerate() {
+        let width = width.min(available);
+        if index > start && used + CHIP_SPACING + width > available {
+            lines.push(start..index);
+            start = index;
+            used = width;
+        } else {
+            used += if index > start { CHIP_SPACING } else { 0.0 } + width;
+        }
+    }
+    if start < widths.len() {
+        lines.push(start..widths.len());
+    }
+    lines
 }
 
 /// Height reserved for one line of chips, tall enough for the maximum number
@@ -1063,7 +1081,7 @@ impl Viewer {
     /// Fill the main grid with the currently selected side of the collected
     /// rule rows.
     fn apply_rule_view(&mut self) -> Task<Message> {
-        let (rows, total) = {
+        let (mut rows, total) = {
             let Some(hits) = &self.rules.hits else {
                 return Task::none();
             };
@@ -1081,9 +1099,14 @@ impl Viewer {
             }
             (rows, hits.hits.len())
         };
+        // Honor the "rows" drop-down even in the rule view: the filter stays in
+        // force, only the number of displayed rows changes. `matched` keeps the
+        // full count so the status line can say how many were truncated.
+        let matching = rows.len();
+        rows.truncate(self.limit);
         self.rows = rows;
-        self.matched = self.rows.len();
-        self.truncated = false;
+        self.matched = matching;
+        self.truncated = matching > self.rows.len();
         self.rows_read = total;
         self.indexed_result = false;
         self.error = None;
@@ -1146,6 +1169,12 @@ impl Viewer {
             }
             Message::LimitSelected(limit) => {
                 self.limit = limit.max(1);
+                // The rule view is a filter, not a scan: changing how many rows
+                // are shown must keep the rule / outcome filter in place and
+                // only re-slice the rows it already collected.
+                if self.rules.view_active {
+                    return self.apply_rule_view();
+                }
                 self.start_scan()
             }
             Message::ToggleIndex(column) => {
@@ -1884,22 +1913,28 @@ impl Viewer {
             .align_y(Center)
             .padding([0.0, 4.0]);
 
-        // Chip geometry: how many chips fit on a line depends on how wide a chip
-        // actually is, which follows the visible values (or the headers when the
-        // attribute names are shown). `columns`/`chip_max` are uniform for the
-        // whole list so every stripe keeps the same height, which is what the
-        // virtual scrolling relies on.
+        // Chip geometry: how many chips fit on a line is decided per row by
+        // greedy packing, so a row of narrow chips fills the line instead of
+        // leaving a gap after a fixed column count.
         let all_hidden = !self.headers.is_empty() && self.muted.len() >= self.headers.len();
         let visible_columns: Vec<usize> = (0..self.headers.len())
             .filter(|index| !self.muted.contains(index))
             .collect();
-        let chip_width = typical_chip_width(
-            &self.rows,
-            &visible_columns,
-            &self.headers,
-            self.show_attr_names,
-        );
-        let (columns, chip_max, hidden_columns) = chip_layout(self.window_width, chip_width);
+        // The grid shrinks when the rules sidebar is docked, so size the chips
+        // from the width the grid actually gets rather than the window width.
+        // Using the window width here is what let a full line of chips overflow
+        // (and get clipped) while the rules panel was open.
+        let grid_width = self.window_width
+            - 2.0 * CONTENT_PADDING
+            - if self.show_rules {
+                sidebar_width(self.window_width) + MAIN_GAP
+            } else {
+                0.0
+            };
+        // Width a chip line may use, and how many hidden-attribute chips fit on
+        // one line in the controls bar.
+        let available = chip_area_width(grid_width);
+        let hidden_columns = ((available / 210.0).floor() as usize).max(1);
 
         // The scan/view options live with the attribute controls (rather than
         // squeezed into the search bar) and wrap on narrow windows.
@@ -2158,21 +2193,47 @@ impl Viewer {
         } else {
             // Virtual scrolling: only the rows intersecting the viewport (plus a
             // small overscan) are built, so a long list costs the same per frame
-            // as a short one. Every row is given the same fixed height, which
-            // keeps the computed offsets exact.
+            // as a short one. Chips are packed per row, so rows can have a
+            // different number of lines; a running top offset per row lets the
+            // scroll position be mapped back to a row index exactly.
             let total_rows = self.rows.len();
             let viewport = self.viewport_height.max(1.0);
-            let row_height = if show_table {
-                TABLE_ROW_HEIGHT
-            } else {
-                let line_count = visible_columns.len().div_ceil(columns).max(1);
-                stripe_height(line_count)
-            };
 
-            let first = ((self.scroll_offset / row_height).floor() as usize)
-                .saturating_sub(OVERSCAN_ROWS)
+            let row_heights: Vec<f32> = if show_table {
+                vec![TABLE_ROW_HEIGHT; total_rows]
+            } else {
+                let show_names = self.show_attr_names;
+                self.rows
+                    .iter()
+                    .map(|values| {
+                        let lines = chip_line_count(
+                            visible_columns.iter().map(|&column| {
+                                chip_estimate(
+                                    self.header(column),
+                                    values.get(column).map(String::as_str).unwrap_or(""),
+                                    show_names,
+                                )
+                            }),
+                            available,
+                        );
+                        stripe_height(lines)
+                    })
+                    .collect()
+            };
+            let mut row_tops = Vec::with_capacity(total_rows + 1);
+            row_tops.push(0.0f32);
+            for height in &row_heights {
+                let last = row_tops[row_tops.len() - 1];
+                row_tops.push(last + height);
+            }
+            let total_height = row_tops[total_rows];
+
+            let first = row_tops
+                .partition_point(|&top| top <= self.scroll_offset)
+                .saturating_sub(1 + OVERSCAN_ROWS)
                 .min(total_rows);
-            let last = ((((self.scroll_offset + viewport) / row_height).ceil() as usize)
+            let last = (row_tops
+                .partition_point(|&top| top < self.scroll_offset + viewport)
                 + OVERSCAN_ROWS
                 + 1)
                 .min(total_rows)
@@ -2244,13 +2305,12 @@ impl Viewer {
             }
 
             if first > 0 {
-                list = list.push(Space::with_height(Length::Fixed(
-                    first as f32 * row_height,
-                )));
+                list = list.push(Space::with_height(Length::Fixed(row_tops[first])));
             }
 
             for (offset, values) in self.rows[first..last].iter().enumerate() {
                 let index = first + offset;
+                let row_height = row_heights[index];
                 if show_table {
                     let mut line = Row::new().spacing(0);
                     for (column_position, &column) in visible_columns.iter().enumerate() {
@@ -2278,13 +2338,26 @@ impl Viewer {
                     );
                     continue;
                 }
-                let visible: Vec<usize> = (0..values.len())
-                    .filter(|column| !self.muted.contains(column))
+                // Greedily pack the chips for this row: a chip that does not fit
+                // in the remaining width starts the next line, so a row of
+                // narrow chips uses the whole line instead of a fixed column
+                // count.
+                let show_names = self.show_attr_names;
+                let widths: Vec<f32> = visible_columns
+                    .iter()
+                    .map(|&column| {
+                        chip_estimate(
+                            self.header(column),
+                            values.get(column).map(String::as_str).unwrap_or(""),
+                            show_names,
+                        )
+                    })
                     .collect();
                 let mut block = column![].spacing(CHIP_LINE_SPACING);
-                for chunk in visible.chunks(columns) {
+                for range in chip_lines(&widths, available) {
                     let mut line = Row::new().spacing(CHIP_SPACING);
-                    for &column in chunk {
+                    for position in range {
+                        let column = visible_columns[position];
                         let header = self.header(column);
                         let highlight = attr_matches(&self.attribute_filter, header);
                         let indexed = self.indexes.contains_key(&column);
@@ -2294,15 +2367,15 @@ impl Viewer {
                             &values[column],
                             index,
                             column,
-                            chip_max,
+                            available,
                             highlight,
                             indexed,
                             locked,
-                            self.show_attr_names,
+                            show_names,
                         ));
                     }
                     // Clip each chip line to a fixed height so a very long value
-                    // cannot make one stripe taller than the rest.
+                    // cannot make one line taller than the rest.
                     block = block.push(
                         container(line)
                             .height(Length::Fixed(chip_line_box()))
@@ -2319,7 +2392,7 @@ impl Viewer {
                             .width(Fill)
                             .height(Length::Fixed(row_height))
                             .clip(true)
-                            .padding([STRIPE_PADDING, 12.0]),
+                            .padding([STRIPE_PADDING, STRIPE_PADDING_H]),
                     )
                     .on_press(Message::RowClicked(index))
                     .padding(0)
@@ -2331,7 +2404,7 @@ impl Viewer {
 
             if last < total_rows {
                 list = list.push(Space::with_height(Length::Fixed(
-                    (total_rows - last) as f32 * row_height,
+                    total_height - row_tops[last],
                 )));
             }
         }
@@ -2567,7 +2640,7 @@ impl Viewer {
 
         // Keep the sidebar comfortable without starving the grid on a narrow
         // window.
-        let sidebar_width = (self.window_width * 0.30).clamp(260.0, 340.0);
+        let sidebar_width = sidebar_width(self.window_width);
         container(body)
             .width(Length::Fixed(sidebar_width))
             .height(Fill)
@@ -3198,14 +3271,16 @@ fn chip<'a>(
     };
     let content_width = (max_width - CHIP_CHROME).max(60.0);
     let clipped = estimate_chip_width(&label_text) > max_width;
-    let label = if clipped {
+    // Cap the label to the chip's share of the line so a wide glyph (or a
+    // character-width estimate that undershoots) cannot push the chip past its
+    // slot and spill the row: the text wraps inside the chip, and longer
+    // values are revealed by the tooltip.
+    let label = container(
         text(label_text)
             .size(13)
-            .width(Length::Fixed(content_width))
-            .wrapping(Wrapping::Word)
-    } else {
-        text(label_text).size(13)
-    };
+            .wrapping(Wrapping::WordOrGlyph),
+    )
+    .max_width(content_width);
 
     let database = if indexed {
         Bootstrap::DatabaseFill
@@ -4140,19 +4215,43 @@ mod tests {
     }
 
     #[test]
-    fn chip_layout_is_always_usable() {
-        for width in [0.0, 100.0, 600.0, 1200.0, 4000.0] {
-            for chip_width in [0.0, 120.0, 260.0, 800.0] {
-                let (columns, chip_max, hidden_columns) = chip_layout(width, chip_width);
-                assert!(columns >= 1);
-                assert!(hidden_columns >= 1);
-                assert!(chip_max >= 120.0);
-            }
+    fn chip_lines_fill_each_line_before_wrapping() {
+        // Three 100px chips with 8px spacing: two fit in 260, the third wraps.
+        let available = 260.0;
+        let widths = [100.0, 100.0, 100.0];
+        let lines = chip_lines(&widths, available);
+        assert_eq!(lines, vec![0..2, 2..3]);
+        assert_eq!(chip_line_count(widths.iter().copied(), available), lines.len());
+
+        // A chip wider than the whole line still occupies exactly one line.
+        let wide = [available + 50.0];
+        assert_eq!(chip_line_count(wide.iter().copied(), available), 1);
+        assert_eq!(chip_lines(&wide, available), vec![0..1]);
+
+        // An empty row still reports one line so the stripe keeps a height.
+        assert_eq!(chip_line_count(std::iter::empty(), available), 1);
+    }
+
+    #[test]
+    fn chip_line_count_matches_chip_lines() {
+        let cases: [[f32; 4]; 4] = [
+            [120.0, 40.0, 300.0, 90.0],
+            [500.0, 500.0, 500.0, 500.0],
+            [10.0, 10.0, 10.0, 10.0],
+            [0.0, 0.0, 0.0, 0.0],
+        ];
+        let available = 420.0;
+        for widths in cases {
+            let ranges = chip_lines(&widths, available);
+            assert_eq!(
+                chip_line_count(widths.iter().copied(), available),
+                ranges.len(),
+                "widths {widths:?}"
+            );
+            // Ranges must cover every chip exactly once, in order.
+            let covered: Vec<usize> = ranges.iter().flat_map(|range| range.clone()).collect();
+            assert_eq!(covered, (0..widths.len()).collect::<Vec<_>>());
         }
-        // A wider window fits at least as many chips per line, and narrower
-        // chips fit at least as many as wider ones.
-        assert!(chip_layout(2400.0, 200.0).0 >= chip_layout(800.0, 200.0).0);
-        assert!(chip_layout(1200.0, 120.0).0 >= chip_layout(1200.0, 400.0).0);
     }
 
     #[test]
@@ -4216,6 +4315,39 @@ mod tests {
         // Switching outcome re-uses the cached record: same allocation, so the
         // filter click does not deep-copy every row.
         assert!(Arc::ptr_eq(&viewer.rows[0], &row));
+    }
+
+    #[test]
+    fn changing_limit_keeps_the_rule_filter() {
+        let mut viewer = test_viewer();
+        viewer.rules.hits = Some(RuleHits {
+            rule: 0,
+            hits: (0..5)
+                .map(|index| RowHit {
+                    id: index.to_string(),
+                    row: None,
+                    left: "a".into(),
+                    right: "b".into(),
+                    expected: None,
+                    outcome: RowOutcome::Passed,
+                    cells: Vec::new(),
+                })
+                .collect(),
+            rows: (0..5)
+                .map(|index| Arc::new(vec![format!("v{index}"), "b".into(), "c".into()]))
+                .collect(),
+        });
+        viewer.rules.hits_filter = Some(RowOutcome::Passed);
+        viewer.rules.view_active = true;
+
+        let _ = viewer.update(Message::LimitSelected(2));
+
+        // The rule/outcome filter survives a limit change; only the number of
+        // displayed rows shrinks.
+        assert!(viewer.rules.view_active);
+        assert_eq!(viewer.rows.len(), 2);
+        assert_eq!(viewer.matched, 5);
+        assert!(viewer.truncated);
     }
 
     #[test]
