@@ -553,6 +553,34 @@ that one column at a time (or with a validation rule). Note that while a column
 is **indexed** and the **index** checkbox is on, a non-empty filter is a
 `beginsWith` prefix query rather than a regex.
 
+## Generating fixture data (`fgen`)
+
+`fgen` writes a deterministic CSV of city temperature records (with a matching
+`city,country` reference table) for trying out the tool. A configurable fraction
+of the rows is deliberately corrupted, so the file always mixes **matching** and
+**non-matching** attributes across the bundled weather rules:
+
+```bash
+# 1000 rows, ~10% mismatched, plus the reference mapping.
+cargo run --bin fgen -- 1000 -o examples/weather.csv --reference examples/weather_cities.csv
+
+fvalidate examples/weather.csv -r examples/rules_weather.vl --id-column id
+```
+
+| Option | Meaning |
+| --- | --- |
+| `<ROWS>` | Number of data rows to generate (positional). |
+| `-o, --output <FILE>` | Output CSV (default `weather.csv`). |
+| `--seed <N>` | Deterministic seed; the same seed reproduces the same file. |
+| `--bad-rate <0..1>` | Fraction of rows with a deliberate mismatch (default `0.1`). |
+| `--start-date <YYYY-MM-DD>` | First record date (default `2024-01-01`). |
+| `--days <N>` | Days the records are spread over (default `365`). |
+| `--reference <FILE>` | Also write the `city,country` reference table. |
+
+Each row has `id`, `city`, `country`, `recorded_on`, `temp_c`, `temp_f` and
+`humidity_pct`. Non-matching rows cycle through three flaws: a swapped country,
+a Fahrenheit value that disagrees with the Celsius reading, and a non-ISO date.
+
 ## Project layout
 
 ```
@@ -560,6 +588,7 @@ src/
   main.rs       CLI, stdin spooling, output
   lib.rs        library target shared by `fvalidate` and `fview`
   bin/fview.rs  optional GUI viewer + rule-evaluation panel (feature `gui`)
+  bin/fgen.rs   deterministic temperature-record generator (fixture data)
   dsl.rs        DSL tokenizer/parser -> Program
   rules.rs      compilation of rules against headers (column indices)
   transform.rs  value transforms
@@ -586,6 +615,8 @@ examples/
   loose.csv    fallback / skip / mapping_filter fixture
   loose_map.csv
   rules_filters.vl     or(...) + validation_skipped + mapping_filter example
+  weather_cities.csv   city -> country reference used by `rules_weather.vl`
+  rules_weather.vl     temperature-record rules (date, conversion, mapping)
 ```
 
 ## Tests

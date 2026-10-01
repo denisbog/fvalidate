@@ -747,3 +747,49 @@ fn engine_collects_skipped_and_validation_skipped_hits() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The `fgen` fixture generator and the bundled weather rules agree: every rule
+/// sees both matching and non-matching rows, and the reference mapping resolves
+/// every generated city (no drift between the generator and the rules).
+#[test]
+fn generated_weather_data_has_matching_and_non_matching_rows() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-fgen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("weather.csv");
+
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_fgen"))
+        .arg("200")
+        .arg("-o")
+        .arg(&csv_path)
+        .args(["--seed", "11", "--bad-rate", "0.15"])
+        .stdout(Stdio::null())
+        .status()
+        .expect("failed to run fgen");
+    assert!(status.success());
+
+    let csv_str = csv_path.to_str().unwrap();
+    let report = run_json(&[
+        csv_str,
+        "-r",
+        &manifest("examples/rules_weather.vl"),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    let rules = report["rules"].as_array().unwrap();
+    assert_eq!(rules.len(), 3);
+    for rule in rules {
+        assert!(rule["rows_passed"].as_u64().unwrap() > 0, "no passes: {rule}");
+        assert!(
+            rule["rows_failed"].as_u64().unwrap() > 0,
+            "no failures: {rule}"
+        );
+    }
+    // The city -> country rule resolves every generated city.
+    assert_eq!(rules[2]["unmapped_values"].as_u64().unwrap(), 0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

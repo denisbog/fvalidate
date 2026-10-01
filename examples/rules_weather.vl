@@ -1,0 +1,43 @@
+# Validation rules for the city temperature records produced by `fgen`.
+#
+# Generate the data (and a fresh copy of the reference table) with:
+#   cargo run --bin fgen -- 1000 -o examples/weather.csv --reference examples/weather_cities.csv
+#
+# Then validate it:
+#   fvalidate examples/weather.csv -r examples/rules_weather.vl --id-column id
+#
+# The generator deliberately corrupts a fraction of the rows, so this rule set
+# reports both matching and non-matching examples for every rule.
+
+defaults {
+  report_limit = 10
+}
+
+# 1. Date shape: every `recorded_on` must be a plain ISO calendar date. The
+#    generator writes a few `DD/MM/YYYY` rows instead, which fail here.
+rule "recorded_on is an ISO date" {
+  left    = recorded_on
+  pattern = "^\\d{4}-\\d{2}-\\d{2}$"
+  compare = matches
+}
+
+# 2. Fahrenheit must be the rounded conversion of the recorded Celsius value.
+#    `derive` recomputes it from `temp_c`; the generator writes a wrong `temp_f`
+#    on some rows.
+rule "temp_f matches the Celsius conversion" {
+  derive          = 'string(round(float(temp_c) * 9 / 5 + 32)) as expected_f'
+  left            = expected_f
+  right           = temp_f
+  transform_right = int
+}
+
+# 3. The country must match the city according to the reference table. Rows
+#    where the generator swapped the country are reported as failures here (and
+#    no city maps to two countries, so there are no ambiguities).
+rule "country matches the city reference table" {
+  left          = city
+  right         = country
+  mapping_files = ["examples/weather_cities.csv"]
+  mapping_left  = city
+  mapping_right = country
+}
