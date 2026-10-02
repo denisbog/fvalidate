@@ -151,6 +151,7 @@ fn run(cli: Cli) -> Result<bool, String> {
         id_idx,
         progress: Some(progress),
         collect_hits: None,
+        collect_hits_limit: usize::MAX,
     };
 
     let report = engine::run(&plan, &config)?;

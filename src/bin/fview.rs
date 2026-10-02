@@ -65,7 +65,7 @@ use clap::{Parser, ValueEnum};
 use fast_csv::dsl;
 use fast_csv::engine::{self, EngineConfig};
 use fast_csv::report::{Report, RowHit, RowOutcome, RuleReport};
-use fast_csv::rules::{self, ColumnResolver};
+use fast_csv::rules::{self, ColumnResolver, Plan};
 use iced::keyboard::{self, Key};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
@@ -199,8 +199,9 @@ impl ScanResult {
     }
 }
 
-/// State of the rule-evaluation panel: which rule file is loaded, the evaluated
-/// report (if any) and the on-demand full row list for one rule.
+/// State of the rule-evaluation panel: which rule file is loaded, the compiled
+/// program, the evaluated report (if any) and a bounded cache of the full row
+/// lists collected for individual rules.
 #[derive(Debug, Default)]
 struct RulesState {
     /// Rules DSL file chosen by the user.
@@ -209,10 +210,15 @@ struct RulesState {
     id_column: String,
     /// Result of the last evaluation, kept in memory for the panel.
     report: Option<Report>,
+    /// The compiled rules program for the current CSV. Kept so collecting one
+    /// rule's rows never re-reads or recompiles the rules file.
+    plan: Option<Arc<Plan>>,
     error: Option<String>,
     evaluating: bool,
     /// Complete row list of one rule (every outcome), with the full CSV row for
-    /// each hit. It feeds the main grid when a rule filter is active.
+    /// each hit. It feeds the main grid when a rule filter is active. Only one
+    /// rule's rows are ever kept: collecting another rule drops them so the
+    /// process never holds several multi-million-row lists at once.
     hits: Option<RuleHits>,
     /// Which side of `hits` the grid shows: `None` = every row, otherwise only
     /// rows with that outcome (passed, failed, skipped, validation-skipped).
@@ -223,6 +229,10 @@ struct RulesState {
     /// Rule whose rows are being collected for the grid.
     pending_rule: Option<usize>,
     collecting: bool,
+    /// Latest rule the user asked for while another collection was running.
+    /// Started once the in-flight pass finishes, so rapid clicks never launch
+    /// several whole-file evaluations at the same time.
+    queued_rule: Option<(usize, Option<RowOutcome>)>,
     /// Restrict the main grid (and the detail form) to the attributes the
     /// active rule references.
     attrs_only: bool,
@@ -237,15 +247,49 @@ struct RulesState {
     collect_duration: Option<Duration>,
 }
 
+/// The compiled rules program and its evaluation result, returned together so
+/// the panel can cache the program and re-evaluate a single rule later without
+/// reloading the DSL file.
+#[derive(Debug, Clone)]
+struct EvaluatedRules {
+    plan: Arc<Plan>,
+    report: Report,
+}
+
 /// Every row of one rule (passed, failed, skipped or validation-skipped),
 /// together with the full CSV row for each hit (in `hits` order) so the main
-/// grid can render the attributes.
+/// grid can render the attributes. The retained list is capped per outcome, so
+/// `passed`/`failed`/... carry the exact totals from the full evaluation.
 #[derive(Debug, Clone)]
 struct RuleHits {
     rule: usize,
+    /// Per-outcome cap used when collecting. A larger display limit needs a
+    /// fresh collection.
+    cap: usize,
     hits: Vec<RowHit>,
     /// Shared with the grid: switching outcome clones the `Arc`s, not the rows.
     rows: Vec<Arc<Vec<String>>>,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    validation_skipped: u64,
+}
+
+impl RuleHits {
+    /// Exact number of rows with the given outcome (or all rows when `None`).
+    /// The retained `hits` list is capped, so the collected length cannot be
+    /// used as the total.
+    fn total_for(&self, outcome: Option<RowOutcome>) -> u64 {
+        match outcome {
+            None => {
+                self.passed + self.failed + self.skipped + self.validation_skipped
+            }
+            Some(RowOutcome::Passed) => self.passed,
+            Some(RowOutcome::Failed) => self.failed,
+            Some(RowOutcome::Skipped) => self.skipped,
+            Some(RowOutcome::ValidationSkipped) => self.validation_skipped,
+        }
+    }
 }
 
 /// The row opened in the floating detail form.
@@ -560,7 +604,7 @@ enum Message {
     /// Evaluate the selected rules against the open CSV.
     EvaluateRules,
     /// `(generation, result)`; stale generations are ignored.
-    RulesEvaluated(u64, Result<Report, String>),
+    RulesEvaluated(u64, Result<EvaluatedRules, String>),
     /// Collect the complete row list for one rule (click on a rule name).
     RuleAllRows(usize),
     /// Show only one outcome of a rule's rows: `(rule, outcome)`.
@@ -761,12 +805,14 @@ impl Viewer {
         // the chosen rules file and id column for a quick re-evaluation).
         self.rules.generation += 1;
         self.rules.report = None;
-        self.rules.hits = None;
+        self.rules.plan = None;
+        discard_rule_hits(self.rules.hits.take());
         self.rules.hits_filter = None;
         self.rules.view_active = false;
         self.rules.pending_rule = None;
         self.rules.evaluating = false;
         self.rules.collecting = false;
+        self.rules.queued_rule = None;
         self.rules.saved_muted = None;
         self.rules.error = None;
         self.last_chip_click = None;
@@ -882,10 +928,13 @@ impl Viewer {
         let Some(path) = self.path.clone() else {
             return Task::none();
         };
-        // A fresh search always leaves the rule-filtered grid.
+        // A fresh search always leaves the rule-filtered grid and abandons any
+        // rule-row collection (the result would otherwise overwrite the scan).
+        // The collected rows are dropped too, so a large rule list does not
+        // linger in memory after the user leaves the rule view.
         self.rules.view_active = false;
-        self.rules.pending_rule = None;
-        self.rules.collecting = false;
+        discard_rule_hits(self.rules.hits.take());
+        self.abort_rule_collection();
         self.sync_rule_attrs();
         if self.scanning {
             self.dirty = true;
@@ -963,18 +1012,33 @@ impl Viewer {
         let restore_grid = self.rules.view_active;
         self.rules.evaluating = true;
         self.rules.error = None;
-        self.rules.hits = None;
+        discard_rule_hits(self.rules.hits.take());
         self.rules.hits_filter = None;
         self.rules.view_active = false;
+        self.rules.plan = None;
         self.rules.pending_rule = None;
         self.rules.collecting = false;
+        self.rules.queued_rule = None;
         self.sync_rule_attrs();
         self.rules.generation += 1;
         let generation = self.rules.generation;
         let delimiter = self.delimiter;
         let id_column = self.rules.id_column.clone();
+        let headers = self.headers.clone();
         let eval = Task::perform(
-            async move { evaluate_rules(csv, delimiter, rules_path, id_column, None) },
+            async move {
+                // Compile once; the plan is returned so single-rule collections
+                // never reload the file or rebuild the plan.
+                let mut program = dsl::load_file(&rules_path)?;
+                program.defaults.report_limit = 50;
+                let plan = rules::compile(program, &headers)?;
+                let id_idx = resolve_id_idx(&id_column, &headers)?;
+                let report = run_plan(&plan, &csv, delimiter, id_idx, None, usize::MAX)?;
+                Ok(EvaluatedRules {
+                    plan: Arc::new(plan),
+                    report,
+                })
+            },
             move |result| Message::RulesEvaluated(generation, result),
         );
         if restore_grid {
@@ -1008,28 +1072,65 @@ impl Viewer {
         self.cancel_scan();
         // Data already collected: just switch side / re-activate.
         if self.rules.hits.as_ref().map(|hits| hits.rule) == Some(rule) {
+            self.abort_rule_collection();
             self.rules.hits_filter = filter;
             self.rules.view_active = true;
             return self.apply_rule_view();
         }
-        let (Some(csv), Some(rules_path)) = (self.path.clone(), self.rules.path.clone()) else {
+        // A collection for this rule is already running: keep it and just let
+        // the grid show the outcome the user picked last when it lands.
+        if self.rules.collecting && self.rules.pending_rule == Some(rule) {
+            self.rules.queued_rule = None;
+            self.rules.hits_filter = filter;
+            return Task::none();
+        }
+        // Another rule is still being collected: queue this request instead of
+        // running a second whole-file pass in parallel.
+        if self.rules.collecting {
+            self.rules.queued_rule = Some((rule, filter));
+            return Task::none();
+        }
+        let (Some(csv), Some(plan)) = (self.path.clone(), self.rules.plan.clone()) else {
+            self.rules.error = Some("evaluate the rules before browsing their rows".into());
             return Task::none();
         };
+        let id_idx = match resolve_id_idx(&self.rules.id_column, &self.headers) {
+            Ok(id_idx) => id_idx,
+            Err(message) => {
+                self.rules.error = Some(message);
+                return Task::none();
+            }
+        };
         // Collect the rule's rows and their full CSV records in one background
-        // pass, then let the response fill the grid.
+        // pass that evaluates *only* this rule, then let the response fill the
+        // grid.
         self.rules.collecting = true;
         self.rules.pending_rule = Some(rule);
-        self.rules.hits = None;
+        discard_rule_hits(self.rules.hits.take());
         self.rules.hits_filter = filter;
+        self.rules.error = None;
         self.rules.collect_started = Some(Instant::now());
         self.rules.generation += 1;
         let generation = self.rules.generation;
         let delimiter = self.delimiter;
-        let id_column = self.rules.id_column.clone();
+        let limit = self.limit;
         Task::perform(
-            async move { load_rule_rows(csv, delimiter, rules_path, id_column, rule) },
+            async move { collect_rule_hits(plan, rule, csv, delimiter, id_idx, limit) },
             move |result| Message::RuleRowsCollected(generation, rule, result),
         )
+    }
+
+    /// Drop any in-flight or queued rule-row collection. The generation bump
+    /// makes a late result from the abandoned pass harmless, so it cannot
+    /// overwrite the view the user just picked.
+    fn abort_rule_collection(&mut self) {
+        if self.rules.collecting || self.rules.pending_rule.is_some() {
+            self.rules.generation += 1;
+        }
+        self.rules.collecting = false;
+        self.rules.pending_rule = None;
+        self.rules.queued_rule = None;
+        self.rules.collect_started = None;
     }
 
     /// Abandon an in-flight scan so its result cannot overwrite the grid once
@@ -1044,11 +1145,8 @@ impl Viewer {
     /// Stop showing rule rows in the grid and re-run the normal scan.
     fn clear_rule_view(&mut self) -> Task<Message> {
         self.rules.view_active = false;
-        self.rules.collecting = false;
-        self.rules.pending_rule = None;
+        self.abort_rule_collection();
         self.sync_rule_attrs();
-        // Invalidate a collection that may still be running.
-        self.rules.generation += 1;
         self.start_scan()
     }
 
@@ -1081,7 +1179,7 @@ impl Viewer {
     /// Fill the main grid with the currently selected side of the collected
     /// rule rows.
     fn apply_rule_view(&mut self) -> Task<Message> {
-        let (mut rows, total) = {
+        let (mut rows, matching, total) = {
             let Some(hits) = &self.rules.hits else {
                 return Task::none();
             };
@@ -1093,16 +1191,17 @@ impl Viewer {
                     Some(outcome) => hit.outcome == outcome,
                 };
                 if keep {
-                    // Share the cached record; only the pointer is cloned.
+                    // Share the collected record; only the pointer is cloned.
                     rows.push(Arc::clone(row));
                 }
             }
-            (rows, hits.hits.len())
+            // The retained list is capped, so the exact totals come from the
+            // full evaluation rather than from the collected rows.
+            (rows, hits.total_for(filter) as usize, hits.total_for(None) as usize)
         };
         // Honor the "rows" drop-down even in the rule view: the filter stays in
         // force, only the number of displayed rows changes. `matched` keeps the
         // full count so the status line can say how many were truncated.
-        let matching = rows.len();
         rows.truncate(self.limit);
         self.rows = rows;
         self.matched = matching;
@@ -1170,9 +1269,23 @@ impl Viewer {
             Message::LimitSelected(limit) => {
                 self.limit = limit.max(1);
                 // The rule view is a filter, not a scan: changing how many rows
-                // are shown must keep the rule / outcome filter in place and
-                // only re-slice the rows it already collected.
+                // are shown must keep the rule / outcome filter in place. The
+                // collected list is capped per outcome, so a larger limit needs
+                // a fresh collection for that one rule.
                 if self.rules.view_active {
+                    let recollect = self
+                        .rules
+                        .hits
+                        .as_ref()
+                        .is_some_and(|hits| hits.cap < self.limit);
+                    if recollect {
+                        if let Some(rule) = self.active_rule() {
+                            let filter = self.rules.hits_filter;
+                            discard_rule_hits(self.rules.hits.take());
+                            self.rules.view_active = false;
+                            return self.show_rule_rows(rule, filter);
+                        }
+                    }
                     return self.apply_rule_view();
                 }
                 self.start_scan()
@@ -1369,7 +1482,9 @@ impl Viewer {
                 if let Some(path) = path {
                     self.rules.path = Some(path);
                     self.rules.report = None;
-                    self.rules.hits = None;
+                    self.rules.plan = None;
+                    discard_rule_hits(self.rules.hits.take());
+                    self.rules.queued_rule = None;
                     self.rules.error = None;
                     self.start_rules_evaluation()
                 } else {
@@ -1386,16 +1501,19 @@ impl Viewer {
                     return Task::none();
                 }
                 self.rules.evaluating = false;
+                self.rules.queued_rule = None;
                 match result {
-                    Ok(report) => {
-                        self.rules.report = Some(report);
+                    Ok(evaluated) => {
+                        self.rules.plan = Some(evaluated.plan);
+                        self.rules.report = Some(evaluated.report);
                         self.rules.error = None;
-                        self.rules.hits = None;
+                        discard_rule_hits(self.rules.hits.take());
                         self.rules.hits_filter = None;
                         self.rules.view_active = false;
                         self.rules.pending_rule = None;
                     }
                     Err(message) => {
+                        self.rules.plan = None;
                         self.rules.report = None;
                         self.rules.error = Some(message);
                     }
@@ -1414,18 +1532,27 @@ impl Viewer {
                 self.rules.pending_rule = None;
                 self.rules.collect_duration =
                     self.rules.collect_started.take().map(|start| start.elapsed());
-                match result {
+                let task = match result {
                     Ok(hits) => {
+                        // Only one rule's rows are held at a time; the next
+                        // collection drops these before it runs.
                         self.rules.hits = Some(hits);
                         self.rules.view_active = true;
                         self.apply_rule_view()
                     }
                     Err(message) => {
-                        self.rules.hits = None;
+                        discard_rule_hits(self.rules.hits.take());
                         self.rules.view_active = false;
                         self.rules.error = Some(message);
                         Task::none()
                     }
+                };
+                // A rule the user asked for while this pass was running is
+                // evaluated now, so clicks are never dropped.
+                if let Some((queued, filter)) = self.rules.queued_rule.take() {
+                    Task::batch([task, self.show_rule_rows(queued, filter)])
+                } else {
+                    task
                 }
             }
             Message::ClearRuleView => self.clear_rule_view(),
@@ -2074,7 +2201,7 @@ impl Viewer {
         // a note with the count is shown.
         if !self.muted.is_empty() {
             let searching = !self.attribute_filter.trim().is_empty();
-            if !self.show_hidden && !searching {
+            if !self.show_hidden {
                 hidden_bar = hidden_bar.push(text(hidden_note(self.muted.len())).size(13));
             } else {
                 let mut indices: Vec<usize> = self.muted.iter().copied().collect();
@@ -2661,8 +2788,12 @@ impl Viewer {
     ) -> Element<'a, Message> {
         let status = if rule.passed() { "passed" } else { "failed" };
         let active = self.active_rule() == Some(index);
-        let filter = if active { self.rules.hits_filter } else { None };
-        let caret = if active {
+        // The rule being collected is highlighted too, so the panel shows which
+        // rule the grid is (about to be) showing while the background pass runs.
+        let collecting = self.rules.collecting && self.rules.pending_rule == Some(index);
+        let selected = active || collecting;
+        let filter = if selected { self.rules.hits_filter } else { None };
+        let caret = if selected {
             Bootstrap::CaretDownFill
         } else {
             Bootstrap::CaretRightFill
@@ -2756,7 +2887,7 @@ impl Viewer {
                 .spacing(6)
                 .align_y(Center),
             );
-        } else if self.rules.collecting && self.rules.pending_rule == Some(index) {
+        } else if collecting {
             card = card.push(
                 row![
                     text(char::from(Bootstrap::HourglassSplit))
@@ -2769,7 +2900,10 @@ impl Viewer {
             );
         }
 
-        container(card).width(Fill).style(rule_card_style).into()
+        container(card)
+            .width(Fill)
+            .style(move |theme| rule_card_style(theme, selected))
+            .into()
     }
 }
 
@@ -3433,82 +3567,100 @@ fn collect_row(record: &ByteRecord) -> Vec<String> {
         .collect()
 }
 
-/// Compile a rules file and evaluate it against the open CSV. `collect_hits`
-/// selects a rule whose *every* row should be retained (the
-/// "show all rows" action); `None` keeps only the bounded sample.
-fn evaluate_rules(
-    csv: PathBuf,
-    delimiter: u8,
-    rules_path: PathBuf,
-    id_column: String,
-    collect_hits: Option<usize>,
-) -> Result<Report, String> {
-    let headers = engine::read_headers(&csv, delimiter)?;
-    let mut program = dsl::load_file(&rules_path)?;
-    // A few more sample ids than the CLI default makes the panel useful; a
-    // rule-level `report_limit` still wins.
-    program.defaults.report_limit = 50;
-    let plan = rules::compile(program, &headers)?;
-    let id_idx = if id_column.trim().is_empty() {
-        None
-    } else {
-        Some(ColumnResolver::resolve(&id_column, &headers).ok_or_else(|| {
+/// Resolve the optional id column name against the CSV headers. An empty name
+/// means row numbers are used instead of ids.
+fn resolve_id_idx(id_column: &str, headers: &[String]) -> Result<Option<usize>, String> {
+    if id_column.trim().is_empty() {
+        return Ok(None);
+    }
+    ColumnResolver::resolve(id_column, headers)
+        .map(Some)
+        .ok_or_else(|| {
             format!(
                 "id column '{id_column}' not found (available: {})",
                 headers.join(", ")
             )
-        })?)
-    };
+        })
+}
+
+/// Run an already-compiled plan over the CSV. `collect_hits` selects a rule
+/// whose rows should be retained (the "show all rows" action); `None` keeps
+/// only the bounded sample. `hits_limit` caps the retained rows *per outcome*.
+fn run_plan(
+    plan: &Plan,
+    csv: &Path,
+    delimiter: u8,
+    id_idx: Option<usize>,
+    collect_hits: Option<usize>,
+    hits_limit: usize,
+) -> Result<Report, String> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let config = EngineConfig {
-        path: csv,
+        path: csv.to_path_buf(),
         delimiter,
         threads,
         id_idx,
         progress: None,
         collect_hits,
+        collect_hits_limit: hits_limit,
     };
-    engine::run(&plan, &config)
+    engine::run(plan, &config)
 }
 
-/// Re-run the evaluation asking the engine to retain every row of one rule, and
-/// return just those rows.
+/// Release a collected row list without blocking the UI thread. Freeing
+/// millions of `RowHit`s (each with several `String`s) can take seconds, so the
+/// deallocation is handed to a worker thread instead of stalling `update`.
+fn discard_rule_hits(hits: Option<RuleHits>) {
+    if let Some(hits) = hits {
+        rayon::spawn(move || drop(hits));
+    }
+}
+
+/// Collect one rule's rows for the grid. The compiled plan is filtered down to
+/// that rule before the engine runs, so collecting a rule never re-evaluates
+/// the rest of the rule set. At most `limit` rows are retained per outcome, so
+/// an outcome view can still show `limit` rows without materializing the whole
+/// rule. Returns the rule's rows with their captured CSV cells intact.
 fn collect_rule_hits(
+    plan: Arc<Plan>,
+    rule: usize,
     csv: PathBuf,
     delimiter: u8,
-    rules_path: PathBuf,
-    id_column: String,
-    rule: usize,
-) -> Result<Vec<RowHit>, String> {
-    let mut report = evaluate_rules(csv, delimiter, rules_path, id_column, Some(rule))?;
-    report
-        .rules
-        .get_mut(rule)
-        .map(|entry| std::mem::take(&mut entry.hits))
-        .ok_or_else(|| format!("rule {} not found", rule + 1))
-}
-
-/// Collect one rule's complete row list *and* the full CSV record for each hit,
-/// so the main grid can render the rows with all their attributes.
-/// The engine captured each hit's row in the same parallel validation pass, so
-/// no second read of the file is needed here.
-fn load_rule_rows(
-    csv: PathBuf,
-    delimiter: u8,
-    rules_path: PathBuf,
-    id_column: String,
-    rule: usize,
+    id_idx: Option<usize>,
+    limit: usize,
 ) -> Result<RuleHits, String> {
-    let mut hits = collect_rule_hits(csv, delimiter, rules_path, id_column, rule)?;
+    let compiled = plan
+        .rules
+        .get(rule)
+        .cloned()
+        .ok_or_else(|| format!("rule {} not found", rule + 1))?;
+    let single = Plan {
+        rules: vec![compiled],
+    };
+    let mut report = run_plan(&single, &csv, delimiter, id_idx, Some(0), limit)?;
+    let entry = report
+        .rules
+        .get_mut(0)
+        .ok_or_else(|| format!("rule {} not found", rule + 1))?;
+    let mut hits = std::mem::take(&mut entry.hits);
     // Keep each row behind an `Arc` so the grid can switch outcome without
     // copying the record.
     let rows = hits
         .iter_mut()
         .map(|hit| Arc::new(std::mem::take(&mut hit.cells)))
         .collect();
-    Ok(RuleHits { rule, hits, rows })
+    Ok(RuleHits {
+        rule,
+        cap: limit,
+        hits,
+        rows,
+        passed: entry.rows_passed,
+        failed: entry.rows_failed,
+        skipped: entry.rows_skipped,
+        validation_skipped: entry.rows_validation_skipped,
+    })
 }
 
 /// Stream the whole file, count every match and keep the first `limit` rows.
@@ -3912,18 +4064,33 @@ fn outcome_button<'a>(
 }
 
 /// Surface of one rule card inside the panel: a hairline box that separates
-/// rules without competing with the floating panel behind it.
-fn rule_card_style(theme: &Theme) -> container::Style {
+/// rules without competing with the floating panel behind it. The rule whose
+/// rows currently fill the grid (or is being collected for it) gets a primary
+/// tint so the panel makes the active filter obvious.
+fn rule_card_style(theme: &Theme, active: bool) -> container::Style {
     let palette = theme.extended_palette();
+    let surface = if palette.is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.03)
+    } else {
+        Color::from_rgb(0.980, 0.984, 0.992)
+    };
+    let (background, border_color, border_width) = if active {
+        (
+            Color {
+                a: if palette.is_dark { 0.16 } else { 0.10 },
+                ..palette.primary.base.color
+            },
+            palette.primary.base.color,
+            1.5,
+        )
+    } else {
+        (surface, palette.background.strong.color, 1.0)
+    };
     container::Style {
-        background: Some(Background::Color(if palette.is_dark {
-            Color::from_rgba(1.0, 1.0, 1.0, 0.03)
-        } else {
-            Color::from_rgb(0.980, 0.984, 0.992)
-        })),
+        background: Some(Background::Color(background)),
         border: Border {
-            color: palette.background.strong.color,
-            width: 1.0,
+            color: border_color,
+            width: border_width,
             radius: RADIUS.into(),
         },
         ..container::Style::default()
@@ -4270,12 +4437,69 @@ mod tests {
             "rule \"name exists\" {\n  left = id\n  right = name\n  mapping = none\n}\n",
         )
         .unwrap();
-        let hits = collect_rule_hits(path, b',', rules_path, "id".into(), 0).unwrap();
-        assert_eq!(hits.len(), 3);
-        assert_eq!(hits[0].cells, vec!["1".to_string(), "Alice".to_string()]);
-        assert_eq!(hits[2].cells, vec!["3".to_string(), "Cara".to_string()]);
+        let headers = engine::read_headers(&path, b',').unwrap();
+        let program = dsl::load_file(&rules_path).unwrap();
+        let plan = Arc::new(rules::compile(program, &headers).unwrap());
+        let hits = collect_rule_hits(plan, 0, path, b',', Some(0), usize::MAX).unwrap();
+        assert_eq!(hits.hits.len(), 3);
+        assert_eq!(*hits.rows[0], vec!["1".to_string(), "Alice".to_string()]);
+        assert_eq!(*hits.rows[2], vec!["3".to_string(), "Cara".to_string()]);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn collecting_one_rule_ignores_the_others() {
+        // The plan holds two rules but only the requested one is evaluated, so
+        // switching rules never re-runs the whole rule set.
+        let dir = std::env::temp_dir().join(format!("fview-single-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.csv");
+        std::fs::write(&path, "id,a,b\n1,x,x\n2,y,z\n").unwrap();
+        let rules_path = dir.join("r.vl");
+        std::fs::write(
+            &rules_path,
+            "rule \"a\" {\n  left = a\n  right = b\n  mapping = none\n}\n\
+             rule \"id\" {\n  left = id\n  right = a\n  mapping = none\n}\n",
+        )
+        .unwrap();
+        let headers = engine::read_headers(&path, b',').unwrap();
+        let program = dsl::load_file(&rules_path).unwrap();
+        let plan = Arc::new(rules::compile(program, &headers).unwrap());
+
+        let a = collect_rule_hits(Arc::clone(&plan), 0, path.clone(), b',', Some(0), usize::MAX)
+            .unwrap();
+        assert_eq!(a.hits.len(), 2);
+        assert_eq!(a.hits.iter().filter(|hit| hit.passed()).count(), 1);
+        assert_eq!(a.passed, 1);
+        assert_eq!(a.failed, 1);
+
+        let id = collect_rule_hits(plan, 1, path, b',', Some(0), usize::MAX).unwrap();
+        assert_eq!(id.hits.len(), 2);
+        assert!(id.hits.iter().all(|hit| !hit.passed()));
+        assert_eq!(id.failed, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clicking_another_rule_queues_while_collecting() {
+        let mut viewer = test_viewer();
+        viewer.path = Some(PathBuf::from("/tmp/fview-queued.csv"));
+        viewer.rules.plan = Some(Arc::new(Plan { rules: Vec::new() }));
+        viewer.rules.collecting = true;
+        viewer.rules.pending_rule = Some(0);
+
+        // A click on a second rule is queued instead of launching a parallel
+        // whole-file evaluation.
+        let _ = viewer.update(Message::RuleAllRows(1));
+        assert_eq!(viewer.rules.queued_rule, Some((1, None)));
+        assert_eq!(viewer.rules.pending_rule, Some(0));
+
+        // Clicking the rule already being collected drops the queued one.
+        let _ = viewer.update(Message::RuleFilterRows(0, RowOutcome::Failed));
+        assert_eq!(viewer.rules.queued_rule, None);
+        assert_eq!(viewer.rules.hits_filter, Some(RowOutcome::Failed));
     }
 
     /// A minimal viewer with three headers and no file, for testing the
@@ -4298,6 +4522,7 @@ mod tests {
         let row = Arc::new(vec!["a".to_string(), "b".to_string(), "c".to_string()]);
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
+            cap: 100,
             hits: vec![RowHit {
                 id: "1".into(),
                 row: None,
@@ -4308,6 +4533,10 @@ mod tests {
                 cells: Vec::new(),
             }],
             rows: vec![Arc::clone(&row)],
+            passed: 1,
+            failed: 0,
+            skipped: 0,
+            validation_skipped: 0,
         });
         viewer.rules.hits_filter = Some(RowOutcome::Passed);
         let _ = viewer.apply_rule_view();
@@ -4322,6 +4551,7 @@ mod tests {
         let mut viewer = test_viewer();
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
+            cap: 100,
             hits: (0..5)
                 .map(|index| RowHit {
                     id: index.to_string(),
@@ -4336,6 +4566,10 @@ mod tests {
             rows: (0..5)
                 .map(|index| Arc::new(vec![format!("v{index}"), "b".into(), "c".into()]))
                 .collect(),
+            passed: 5,
+            failed: 0,
+            skipped: 0,
+            validation_skipped: 0,
         });
         viewer.rules.hits_filter = Some(RowOutcome::Passed);
         viewer.rules.view_active = true;
@@ -4389,8 +4623,13 @@ mod tests {
         viewer.rules.attrs_only = true;
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
+            cap: 100,
             hits: Vec::new(),
             rows: Vec::new(),
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            validation_skipped: 0,
         });
         viewer.rules.view_active = true;
         viewer.sync_rule_attrs();

@@ -51,6 +51,12 @@ pub struct EngineConfig {
     /// collected (in file order) into `RuleReport::hits`. Used by the GUI's
     /// "show all rows" action; the regular report stays bounded otherwise.
     pub collect_hits: Option<usize>,
+    /// Maximum number of `RuleReport::hits` retained *per outcome* when
+    /// `collect_hits` is set. Capping per outcome (rather than overall) keeps
+    /// every outcome browsable: the GUI passes its row limit so "show all /
+    /// passed / failed / skipped" can each display that many rows without
+    /// materializing the whole rule. Use `usize::MAX` to keep every row.
+    pub collect_hits_limit: usize,
 }
 
 /// Read the header row of the main input.
@@ -255,13 +261,18 @@ struct RuleAccum {
     skip_results: ResultGroups,
     /// Every row of the rule, collected only when `collect_hits` selects it.
     hits: Vec<RowHit>,
+    /// Maximum hits kept per outcome (see `EngineConfig::collect_hits_limit`).
+    hits_limit: usize,
+    /// How many hits of each outcome `hits` currently holds, indexed by
+    /// `RowOutcome::index`.
+    hits_collected: [usize; 4],
     /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
     /// reported.
     ambiguous_samples: Sampler<Example>,
 }
 
 impl RuleAccum {
-    fn new(limit: usize) -> Self {
+    fn new(limit: usize, hits_limit: usize) -> Self {
         RuleAccum {
             checked: 0,
             passed: 0,
@@ -274,8 +285,21 @@ impl RuleAccum {
             fail_results: ResultGroups::new(limit),
             skip_results: ResultGroups::new(limit),
             hits: Vec::new(),
+            hits_limit,
+            hits_collected: [0; 4],
             ambiguous_samples: Sampler::new(limit),
         }
+    }
+
+    /// Whether another hit with this outcome fits under the per-outcome cap.
+    fn wants_hit(&self, outcome: RowOutcome) -> bool {
+        self.hits_collected[outcome.index()] < self.hits_limit
+    }
+
+    /// Record a hit and count it against the per-outcome cap.
+    fn push_hit(&mut self, hit: RowHit) {
+        self.hits_collected[hit.outcome.index()] += 1;
+        self.hits.push(hit);
     }
 
     fn merge(&mut self, other: RuleAccum) {
@@ -289,7 +313,13 @@ impl RuleAccum {
         self.pass_results.merge(other.pass_results);
         self.fail_results.merge(other.fail_results);
         self.skip_results.merge(other.skip_results);
-        self.hits.extend(other.hits);
+        // Another pass may have hit the cap for an outcome; only keep what still
+        // fits, preserving file order across the merged segments.
+        for hit in other.hits {
+            if self.wants_hit(hit.outcome) {
+                self.push_hit(hit);
+            }
+        }
         self.ambiguous_samples.merge(other.ambiguous_samples);
     }
 }
@@ -651,11 +681,12 @@ fn validate_segment(
     to: u64,
     row_base: Option<u64>,
     collect_hits: Option<usize>,
+    hits_limit: usize,
     progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<RuleAccum>, String> {
     let mut accums: Vec<RuleAccum> = rules
         .iter()
-        .map(|rule| RuleAccum::new(rule.report_limit))
+        .map(|rule| RuleAccum::new(rule.report_limit, hits_limit))
         .collect();
     let mut reader = open_segment(path, delimiter, from, to, progress)?;
     let mut record = ByteRecord::new();
@@ -697,8 +728,9 @@ fn validate_segment(
                 if predicate_holds(predicate, &cells, slots, rule.trim) {
                     accum.checked += 1;
                     accum.validation_skipped += 1;
-                    let want_hits = collect_hits == Some(rule_index);
-                    if !accum.skip_results.is_disabled() || want_hits {
+                    let want_hit = collect_hits == Some(rule_index)
+                        && accum.wants_hit(RowOutcome::ValidationSkipped);
+                    if !accum.skip_results.is_disabled() || want_hit {
                         // Compose the values anyway so the skipped rows are
                         // reported next to the matching and failing ones.
                         let _ = compose_side(
@@ -729,8 +761,8 @@ fn validate_segment(
                         if !accum.skip_results.is_disabled() {
                             accum.skip_results.observe(&left_buf, &right_buf, None, &id);
                         }
-                        if want_hits {
-                            accum.hits.push(RowHit {
+                        if want_hit {
+                            accum.push_hit(RowHit {
                                 id,
                                 row: row_number,
                                 left: left_buf.clone(),
@@ -778,9 +810,9 @@ fn validate_segment(
             {
                 accum.checked += 1;
                 accum.skipped += 1;
-                if collect_hits == Some(rule_index) {
+                if collect_hits == Some(rule_index) && accum.wants_hit(RowOutcome::Skipped) {
                     let id = row_id(slots, &cells, row_number, local_row);
-                    accum.hits.push(RowHit {
+                    accum.push_hit(RowHit {
                         id,
                         row: row_number,
                         left: left_buf.clone(),
@@ -924,7 +956,8 @@ fn validate_segment(
             let want_hits = collect_hits == Some(rule_index);
             if matched {
                 accum.passed += 1;
-                if !accum.pass_results.is_disabled() || want_hits {
+                let want_hit = want_hits && accum.wants_hit(RowOutcome::Passed);
+                if !accum.pass_results.is_disabled() || want_hit {
                     let expected_example =
                         sample_expected(rule.pattern.as_ref(), mapping, expected);
                     if !accum.pass_results.is_disabled() {
@@ -935,8 +968,8 @@ fn validate_segment(
                             &id,
                         );
                     }
-                    if want_hits {
-                        accum.hits.push(RowHit {
+                    if want_hit {
+                        accum.push_hit(RowHit {
                             id: id.clone(),
                             row: row_number,
                             left: left_buf.clone(),
@@ -949,7 +982,8 @@ fn validate_segment(
                 }
             } else {
                 accum.failed += 1;
-                if !accum.fail_results.is_disabled() || want_hits {
+                let want_hit = want_hits && accum.wants_hit(RowOutcome::Failed);
+                if !accum.fail_results.is_disabled() || want_hit {
                     let expected_example =
                         sample_expected(rule.pattern.as_ref(), mapping, expected);
                     if !accum.fail_results.is_disabled() {
@@ -960,8 +994,8 @@ fn validate_segment(
                             &id,
                         );
                     }
-                    if want_hits {
-                        accum.hits.push(RowHit {
+                    if want_hit {
+                        accum.push_hit(RowHit {
                             id: id.clone(),
                             row: row_number,
                             left: left_buf.clone(),
@@ -1231,6 +1265,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                     to,
                     row_base,
                     config.collect_hits,
+                    config.collect_hits_limit,
                     progress,
                 )
             })
@@ -1240,7 +1275,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
     let mut accums: Vec<RuleAccum> = plan
         .rules
         .iter()
-        .map(|rule| RuleAccum::new(rule.report_limit))
+        .map(|rule| RuleAccum::new(rule.report_limit, config.collect_hits_limit))
         .collect();
     for segment in per_segment {
         for (index, accum) in segment.into_iter().enumerate() {

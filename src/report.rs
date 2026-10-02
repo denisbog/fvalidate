@@ -34,6 +34,17 @@ impl RowOutcome {
     pub fn passed(self) -> bool {
         matches!(self, RowOutcome::Passed)
     }
+
+    /// Stable position of the outcome, used to index small per-outcome counters
+    /// (hit caps) without a map.
+    pub fn index(self) -> usize {
+        match self {
+            RowOutcome::Passed => 0,
+            RowOutcome::Failed => 1,
+            RowOutcome::Skipped => 2,
+            RowOutcome::ValidationSkipped => 3,
+        }
+    }
 }
 
 /// One row that matched, failed, was skipped or was validation-skipped. Unlike

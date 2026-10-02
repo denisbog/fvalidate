@@ -260,6 +260,7 @@ impl CompiledRule {
     }
 }
 
+#[derive(Debug)]
 pub struct Plan {
     pub rules: Vec<CompiledRule>,
 }

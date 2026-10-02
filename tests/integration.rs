@@ -645,6 +645,7 @@ fn engine_collects_all_hits_and_rule_columns() {
         id_idx: Some(0),
         progress: None,
         collect_hits: Some(0),
+        collect_hits_limit: usize::MAX,
     };
 
     let report = engine::run(&plan, &config).unwrap();
@@ -719,6 +720,7 @@ fn engine_collects_skipped_and_validation_skipped_hits() {
             id_idx: Some(0),
             progress: None,
             collect_hits: Some(0),
+            collect_hits_limit: usize::MAX,
         },
     )
     .unwrap();
@@ -744,6 +746,65 @@ fn engine_collects_skipped_and_validation_skipped_hits() {
         .find(|hit| hit.outcome == RowOutcome::Skipped)
         .unwrap();
     assert_eq!(skipped.cells, vec!["3".to_string(), String::new(), String::new(), "ok".to_string()]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `collect_hits_limit` caps the retained hits *per outcome*, so an outcome
+/// view can still show that many rows while a rule matching the whole file
+/// never materializes every row. The exact per-outcome totals stay available.
+#[test]
+fn collect_hits_is_capped_per_outcome() {
+    use fast_csv::engine::{self, EngineConfig};
+    use fast_csv::{dsl, rules};
+
+    let dir = std::env::temp_dir().join(format!("fvalidate-hit-cap-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let rules_path = dir.join("rules.vl");
+
+    // 4 passes (a == b) then 3 failures (a != b).
+    std::fs::write(
+        &csv_path,
+        "id,a,b\n1,x,x\n2,x,x\n3,x,x\n4,x,x\n5,x,y\n6,x,y\n7,x,y\n",
+    )
+    .unwrap();
+    std::fs::write(
+        &rules_path,
+        "rule \"eq\" {\n  left = a\n  right = b\n  mapping = none\n}\n",
+    )
+    .unwrap();
+
+    let headers = engine::read_headers(&csv_path, b',').unwrap();
+    let program = dsl::load_file(&rules_path).unwrap();
+    let plan = rules::compile(program, &headers).unwrap();
+    let report = engine::run(
+        &plan,
+        &EngineConfig {
+            path: csv_path.clone(),
+            delimiter: b',',
+            threads: 1,
+            id_idx: Some(0),
+            progress: None,
+            collect_hits: Some(0),
+            collect_hits_limit: 2,
+        },
+    )
+    .unwrap();
+
+    let rule = &report.rules[0];
+    // Totals are exact even though the rows themselves are capped.
+    assert_eq!(rule.rows_passed, 4);
+    assert_eq!(rule.rows_failed, 3);
+    // At most two rows per outcome are retained.
+    assert_eq!(rule.hits.len(), 4);
+    let passed = rule.hits.iter().filter(|hit| hit.passed()).count();
+    let failed = rule.hits.iter().filter(|hit| !hit.passed()).count();
+    assert_eq!(passed, 2);
+    assert_eq!(failed, 2);
+    // The retained rows are the first ones in file order.
+    let ids: Vec<&str> = rule.hits.iter().map(|hit| hit.id.as_str()).collect();
+    assert_eq!(ids, vec!["1", "2", "5", "6"]);
 
     std::fs::remove_dir_all(&dir).ok();
 }
