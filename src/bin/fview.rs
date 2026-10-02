@@ -65,7 +65,7 @@ use clap::{Parser, ValueEnum};
 use fast_csv::dsl;
 use fast_csv::engine::{self, EngineConfig};
 use fast_csv::report::{Report, RowHit, RowOutcome, RuleReport};
-use fast_csv::rules::{self, ColumnResolver, Plan};
+use fast_csv::rules::{self, Plan};
 use iced::keyboard::{self, Key};
 use iced::widget::scrollable::AbsoluteOffset;
 use iced::widget::text::Wrapping;
@@ -206,8 +206,6 @@ impl ScanResult {
 struct RulesState {
     /// Rules DSL file chosen by the user.
     path: Option<PathBuf>,
-    /// Column holding the row id used by the report; empty means row numbers.
-    id_column: String,
     /// Result of the last evaluation, kept in memory for the panel.
     report: Option<Report>,
     /// The compiled rules program for the current CSV. Kept so collecting one
@@ -599,10 +597,6 @@ enum Message {
     /// Open a native picker for the rules DSL file.
     OpenRules,
     RulesChosen(Option<PathBuf>),
-    /// The id-column name used when evaluating the rules changed.
-    RulesIdColumnChanged(String),
-    /// Evaluate the selected rules against the open CSV.
-    EvaluateRules,
     /// `(generation, result)`; stale generations are ignored.
     RulesEvaluated(u64, Result<EvaluatedRules, String>),
     /// Collect the complete row list for one rule (click on a rule name).
@@ -1023,7 +1017,6 @@ impl Viewer {
         self.rules.generation += 1;
         let generation = self.rules.generation;
         let delimiter = self.delimiter;
-        let id_column = self.rules.id_column.clone();
         let headers = self.headers.clone();
         let eval = Task::perform(
             async move {
@@ -1032,8 +1025,7 @@ impl Viewer {
                 let mut program = dsl::load_file(&rules_path)?;
                 program.defaults.report_limit = 50;
                 let plan = rules::compile(program, &headers)?;
-                let id_idx = resolve_id_idx(&id_column, &headers)?;
-                let report = run_plan(&plan, &csv, delimiter, id_idx, None, usize::MAX)?;
+                let report = run_plan(&plan, &csv, delimiter, None, usize::MAX)?;
                 Ok(EvaluatedRules {
                     plan: Arc::new(plan),
                     report,
@@ -1094,13 +1086,6 @@ impl Viewer {
             self.rules.error = Some("evaluate the rules before browsing their rows".into());
             return Task::none();
         };
-        let id_idx = match resolve_id_idx(&self.rules.id_column, &self.headers) {
-            Ok(id_idx) => id_idx,
-            Err(message) => {
-                self.rules.error = Some(message);
-                return Task::none();
-            }
-        };
         // Collect the rule's rows and their full CSV records in one background
         // pass that evaluates *only* this rule, then let the response fill the
         // grid.
@@ -1115,7 +1100,7 @@ impl Viewer {
         let delimiter = self.delimiter;
         let limit = self.limit;
         Task::perform(
-            async move { collect_rule_hits(plan, rule, csv, delimiter, id_idx, limit) },
+            async move { collect_rule_hits(plan, rule, csv, delimiter, limit) },
             move |result| Message::RuleRowsCollected(generation, rule, result),
         )
     }
@@ -1491,11 +1476,6 @@ impl Viewer {
                     Task::none()
                 }
             }
-            Message::RulesIdColumnChanged(value) => {
-                self.rules.id_column = value;
-                Task::none()
-            }
-            Message::EvaluateRules => self.start_rules_evaluation(),
             Message::RulesEvaluated(generation, result) => {
                 if generation != self.rules.generation {
                     return Task::none();
@@ -2654,18 +2634,6 @@ impl Viewer {
         .padding([6, 12])
         .style(secondary_button);
 
-        let evaluate = button(
-            row![
-                text(char::from(Bootstrap::PlayFill)).font(BOOTSTRAP_FONT).size(13),
-                text("Evaluate"),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        )
-        .on_press(Message::EvaluateRules)
-        .padding([6, 14])
-        .style(primary_button);
-
         let close = button(text(char::from(Bootstrap::XLg)).font(BOOTSTRAP_FONT).size(14))
             .on_press(Message::ToggleRulesPanel)
             .padding([4, 8])
@@ -2683,18 +2651,20 @@ impl Viewer {
             ]
             .spacing(8)
             .align_y(Center),
-            row![open_rules, evaluate].spacing(8).align_y(Center),
-            container(text(rules_name).size(12).color(muted_text(&theme)))
+            row![
+                open_rules,
+                container(
+                    text(rules_name)
+                        .size(12)
+                        .color(muted_text(&theme))
+                        .wrapping(Wrapping::Word),
+                )
                 .padding([3, 8])
+                .width(Fill)
                 .style(badge_style),
-            text("id column").size(12).color(muted_text(&theme)),
-            text_input("auto (row numbers)", &self.rules.id_column)
-                .on_input(Message::RulesIdColumnChanged)
-                .on_submit(Message::EvaluateRules)
-                .padding(8)
-                .size(13)
-                .style(input_style)
-                .width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Center),
             checkbox("rule attributes only", self.rules.attrs_only)
                 .on_toggle(Message::ToggleRuleAttrsOnly)
                 .text_size(12)
@@ -3567,22 +3537,6 @@ fn collect_row(record: &ByteRecord) -> Vec<String> {
         .collect()
 }
 
-/// Resolve the optional id column name against the CSV headers. An empty name
-/// means row numbers are used instead of ids.
-fn resolve_id_idx(id_column: &str, headers: &[String]) -> Result<Option<usize>, String> {
-    if id_column.trim().is_empty() {
-        return Ok(None);
-    }
-    ColumnResolver::resolve(id_column, headers)
-        .map(Some)
-        .ok_or_else(|| {
-            format!(
-                "id column '{id_column}' not found (available: {})",
-                headers.join(", ")
-            )
-        })
-}
-
 /// Run an already-compiled plan over the CSV. `collect_hits` selects a rule
 /// whose rows should be retained (the "show all rows" action); `None` keeps
 /// only the bounded sample. `hits_limit` caps the retained rows *per outcome*.
@@ -3590,7 +3544,6 @@ fn run_plan(
     plan: &Plan,
     csv: &Path,
     delimiter: u8,
-    id_idx: Option<usize>,
     collect_hits: Option<usize>,
     hits_limit: usize,
 ) -> Result<Report, String> {
@@ -3601,7 +3554,9 @@ fn run_plan(
         path: csv.to_path_buf(),
         delimiter,
         threads,
-        id_idx,
+        // The viewer keeps row numbers as the row id: there is no id column
+        // input, and rules are evaluated in parallel.
+        id_idx: None,
         progress: None,
         collect_hits,
         collect_hits_limit: hits_limit,
@@ -3628,7 +3583,6 @@ fn collect_rule_hits(
     rule: usize,
     csv: PathBuf,
     delimiter: u8,
-    id_idx: Option<usize>,
     limit: usize,
 ) -> Result<RuleHits, String> {
     let compiled = plan
@@ -3639,7 +3593,7 @@ fn collect_rule_hits(
     let single = Plan {
         rules: vec![compiled],
     };
-    let mut report = run_plan(&single, &csv, delimiter, id_idx, Some(0), limit)?;
+    let mut report = run_plan(&single, &csv, delimiter, Some(0), limit)?;
     let entry = report
         .rules
         .get_mut(0)
@@ -4440,7 +4394,7 @@ mod tests {
         let headers = engine::read_headers(&path, b',').unwrap();
         let program = dsl::load_file(&rules_path).unwrap();
         let plan = Arc::new(rules::compile(program, &headers).unwrap());
-        let hits = collect_rule_hits(plan, 0, path, b',', Some(0), usize::MAX).unwrap();
+        let hits = collect_rule_hits(plan, 0, path, b',', usize::MAX).unwrap();
         assert_eq!(hits.hits.len(), 3);
         assert_eq!(*hits.rows[0], vec!["1".to_string(), "Alice".to_string()]);
         assert_eq!(*hits.rows[2], vec!["3".to_string(), "Cara".to_string()]);
@@ -4467,14 +4421,13 @@ mod tests {
         let program = dsl::load_file(&rules_path).unwrap();
         let plan = Arc::new(rules::compile(program, &headers).unwrap());
 
-        let a = collect_rule_hits(Arc::clone(&plan), 0, path.clone(), b',', Some(0), usize::MAX)
-            .unwrap();
+        let a = collect_rule_hits(Arc::clone(&plan), 0, path.clone(), b',', usize::MAX).unwrap();
         assert_eq!(a.hits.len(), 2);
         assert_eq!(a.hits.iter().filter(|hit| hit.passed()).count(), 1);
         assert_eq!(a.passed, 1);
         assert_eq!(a.failed, 1);
 
-        let id = collect_rule_hits(plan, 1, path, b',', Some(0), usize::MAX).unwrap();
+        let id = collect_rule_hits(plan, 1, path, b',', usize::MAX).unwrap();
         assert_eq!(id.hits.len(), 2);
         assert!(id.hits.iter().all(|hit| !hit.passed()));
         assert_eq!(id.failed, 2);
