@@ -496,21 +496,22 @@ fvalidate examples/loose.csv -r examples/rules_filters.vl --id-column id
 
 ## GUI viewer (`fview`, optional)
 
-An optional [iced](https://iced.rs) window browses a big CSV and can evaluate a
-rules file against the open file. It lives behind the `gui` feature, so the
-default `fvalidate` build stays dependency-light:
+An optional [egui](https://github.com/emilk/egui) window — the same toolkit as
+the PrintCraft shell — browses a big CSV and can evaluate a rules file against
+the open file. It lives behind the `gui` feature, so the default `fvalidate`
+build stays dependency-light:
 
 ```bash
 cargo run --release --features gui --bin fview -- examples/orders.csv
 ```
 
-The window has a filter/grep toolbar (regex, per-column prefix indexes, chip or
-table view, hide/show attributes, saved profiles) and a **Rules** button that
-docks a vertical rule panel on the left:
+The window has a filter/grep toolbar plus two dockable panels opened from the
+toolbar: a **Config** panel on the left (scan modes, chip/table view,
+hide/show attributes, saved profiles, theme) and a **Rules** panel on the
+right:
 
-* **Open rules…** picks a `.vl` file; **Evaluate** runs it against the CSV that
-  is currently open. An **id column** box names the column whose values identify
-  rows (leave it empty to use row numbers).
+* **Open rules…** picks a `.vl` file and evaluates it against the CSV that is
+  currently open.
 * The panel shows only the per-rule **statistics** (status and
   `checked / passed / failed / skipped / validation skipped`); the rows
   themselves are never listed there.

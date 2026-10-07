@@ -22,7 +22,7 @@ path = "src/bin/fgen.rs"
 default = []
 # Optional GUI viewer (browse rows + evaluate rules). Build with
 # `cargo run --features gui --bin fview`.
-gui = ["dep:iced", "dep:rfd", "dep:iced_fonts", "dep:toml", "dep:dirs", "dep:memmap2"]
+gui = ["dep:egui", "dep:eframe", "dep:egui_extras", "dep:rfd", "dep:toml", "dep:dirs", "dep:memmap2"]
 
 [dependencies]
 simd-csv = "0.14"
@@ -32,15 +32,17 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
-iced = { version = "0.13", optional = true, default-features = false, features = [
-    "tiny-skia",
+egui = { version = "0.36", optional = true }
+egui_extras = { version = "0.36", optional = true, default-features = false, features = ["svg"] }
+eframe = { version = "0.36", optional = true, default-features = false, features = [
+    "default_fonts",
     "wgpu",
-    "tokio",
-    "fira-sans",
-    "auto-detect-theme",
+    "accesskit",
+    "links",
+    "wayland",
+    "x11",
 ] }
 rfd = { version = "0.17", optional = true }
-iced_fonts = { version = "0.2", optional = true, default-features = false, features = ["bootstrap"] }
 memmap2 = { version = "0.9", optional = true }
 toml = { version = "0.8", optional = true }
 dirs = { version = "4", optional = true }
