@@ -13,12 +13,15 @@
 //! an **Open CSV…** button that opens a native file picker (`rfd`).
 //!
 //! Layout:
-//! * the top bar holds the regex filter and the profile controls;
-//! * a second bar holds the attribute filter and, when attributes are hidden,
-//!   a chip per hidden attribute (click a chip to show the attribute again).
-//!   Hidden chips are sorted alphabetically so large attribute lists stay
-//!   navigable; the attribute filter narrows the hidden list to the matching
-//!   names (and highlights the matching chips in the main view);
+//! * a flat menu bar holds the brand, the Open/Rules/Table/Index tabs and the
+//!   file badge;
+//! * the bar below it holds the regex filter and the search button;
+//! * a docking panel on the right holds the configuration: the scan/view
+//!   options, the attribute filter and, when attributes are hidden, a chip per
+//!   hidden attribute (click a chip to show the attribute again). Hidden chips
+//!   are sorted alphabetically so large attribute lists stay navigable, and the
+//!   attribute filter narrows that list (and highlights the matching chips in
+//!   the main view);
 //! * every matching row is rendered as a set of `attribute = value` chips, each
 //!   with a mute icon that hides that attribute from all rows and moves its name
 //!   into the top bar, and a lock icon that pins the attribute so it always
@@ -27,8 +30,9 @@
 //!
 //! Scanning: the filter is **debounced** (a scan starts ~180 ms after the last
 //! keystroke, and an unchanged pattern is never re-scanned). The file is
-//! memory-mapped read-only. Two opt-in checkboxes in the top bar change the
-//! scan: **visible only** searches just the attributes that are currently
+//! memory-mapped read-only. Two opt-in checkboxes in the configuration panel
+//! change the scan: **visible only** searches just the attributes that are
+//! currently
 //! shown, and **parallel** reads the whole file in record-aligned segments
 //! across all cores, which yields exact row/match totals but never exits early.
 //!
@@ -95,6 +99,10 @@ const TABLE_ROW_HEIGHT: f32 = 24.0;
 /// Minimum width of a table column. The table grows horizontally instead of
 /// squeezing columns below this.
 const TABLE_CELL_MIN_WIDTH: f32 = 160.0;
+/// Horizontal room a table header needs besides its label: container padding
+/// plus the database / mute / lock icon column. Folded into the column width so
+/// a long header is never squeezed into wrapping.
+const TABLE_HEADER_CHROME: f32 = 88.0;
 /// Spacing between chips, in px.
 const CHIP_SPACING: f32 = 8.0;
 /// Non-text width of a chip: padding + index icon + mute icon + lock icon +
@@ -126,9 +134,9 @@ const OVERSCAN_ROWS: usize = 3;
 /// Rough width of one character at size 13, used to decide text wrapping.
 const CHAR_WIDTH: f32 = 7.2;
 /// Corner radius shared by cards, inputs and buttons.
-const RADIUS: f32 = 4.0;
+const RADIUS: f32 = 6.0;
 /// Corner radius of the large floating panels.
-const CARD_RADIUS: f32 = 6.0;
+const CARD_RADIUS: f32 = 10.0;
 /// Height reserved for the status line. Fixed so the different states (plain
 /// text, the taller icon + "scanning…" row) do not nudge the rows below it.
 const STATUS_HEIGHT: f32 = 22.0;
@@ -594,6 +602,8 @@ enum Message {
     ScanFinished(u64, Result<ScanResult, String>),
     /// Show or hide the rule-evaluation panel.
     ToggleRulesPanel,
+    /// Show or hide the configuration panel.
+    ToggleConfigPanel,
     /// Open a native picker for the rules DSL file.
     OpenRules,
     RulesChosen(Option<PathBuf>),
@@ -642,6 +652,8 @@ struct Viewer {
     copy_notice: Option<String>,
     /// Whether the rule-evaluation panel is open.
     show_rules: bool,
+    /// Whether the configuration panel is open.
+    show_config: bool,
     /// Rule set + evaluation state for the panel.
     rules: RulesState,
     /// Render `attribute = value` chip labels; off by default so a chip shows
@@ -726,6 +738,7 @@ impl Viewer {
             detail: None,
             copy_notice: None,
             show_rules: false,
+            show_config: true,
             rules: RulesState::default(),
             show_attr_names: false,
             filter_focus: None,
@@ -1449,6 +1462,10 @@ impl Viewer {
                 self.profile_status = None;
                 Task::none()
             }
+            Message::ToggleConfigPanel => {
+                self.show_config = !self.show_config;
+                Task::none()
+            }
             Message::ToggleRulesPanel => {
                 self.show_rules = !self.show_rules;
                 Task::none()
@@ -1793,19 +1810,6 @@ impl Viewer {
         .spacing(8)
         .align_y(Center);
 
-        let open = button(
-            row![
-                text(char::from(Bootstrap::FolderFill))
-                    .font(BOOTSTRAP_FONT)
-                    .size(14),
-                text("Open…"),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        )
-        .on_press(Message::OpenFile)
-        .padding([8, 14])
-        .style(secondary_button);
 
         let file_name = self
             .path
@@ -1958,30 +1962,9 @@ impl Viewer {
         .align_y(Center)
         .wrap();
 
-        // Opens the rule-evaluation panel below the toolbar.
-        let rules_button = button(
-            row![
-                text(char::from(Bootstrap::ClipboardCheck))
-                    .font(BOOTSTRAP_FONT)
-                    .size(14),
-                text("Rules"),
-            ]
-            .spacing(6)
-            .align_y(Center),
-        )
-        .on_press(Message::ToggleRulesPanel)
-        .padding([8, 14])
-        .style(secondary_button);
 
         let toolbar = container(
             row![
-                brand,
-                open,
-                rules_button,
-                container(text(file_name).size(13).color(muted_text(&theme)))
-                    .padding([4, 10])
-                    .style(badge_style),
-                Space::with_width(2),
                 text("Filter").size(13).color(muted_text(&theme)),
                 filter,
                 search,
@@ -1989,10 +1972,9 @@ impl Viewer {
             .spacing(10)
             .align_y(Center),
         )
-        .padding(12)
+        .padding([10, 12])
         .width(Fill)
         .style(card_style);
-
         // The status gets its own line so a long message cannot squeeze the
         // filter field in the bar above. It keeps a fixed height because the
         // scanning/error states are taller than plain status text and would
@@ -2031,21 +2013,31 @@ impl Viewer {
         // from the width the grid actually gets rather than the window width.
         // Using the window width here is what let a full line of chips overflow
         // (and get clipped) while the rules panel was open.
-        let grid_width = self.window_width
-            - 2.0 * CONTENT_PADDING
-            - if self.show_rules {
-                sidebar_width(self.window_width) + MAIN_GAP
-            } else {
-                0.0
-            };
+        // Every docked side panel takes its width from the grid before the
+        // chips are packed, so a full line never overflows under a panel.
+        let panel_width = sidebar_width(self.window_width);
+        let mut grid_width = self.window_width - 2.0 * CONTENT_PADDING;
+        if self.show_rules {
+            grid_width -= panel_width + MAIN_GAP;
+        }
+        if self.show_config {
+            grid_width -= panel_width + MAIN_GAP;
+        }
         // Width a chip line may use, and how many hidden-attribute chips fit on
         // one line in the controls bar.
         let available = chip_area_width(grid_width);
-        let hidden_columns = ((available / 210.0).floor() as usize).max(1);
+        // Hidden-attribute chips flow in a wrapping row inside the
+        // configuration panel, so they pack the panel width instead of one
+        // chip per line.
 
-        // The scan/view options live with the attribute controls (rather than
-        // squeezed into the search bar) and wrap on narrow windows.
-        let mut hidden_bar = column![options].spacing(8).padding(0);
+        // Each group gets a heading so the panel reads as sections: the
+        // view/scan options, then the attributes, then the profiles.
+        let mut hidden_bar = column![
+            text("View").size(13).color(muted_text(&theme)),
+            options,
+        ]
+        .spacing(8)
+        .padding(0);
         let mut controls = Row::new().spacing(10).align_y(Center).width(Fill);
         controls = controls.push(
             button(
@@ -2092,7 +2084,6 @@ impl Viewer {
         }
         // Attribute filter: highlights matching chips in the main view and
         // narrows the hidden attribute list below to the matching names.
-        controls = controls.push(separator());
         controls = controls.push(text("Attributes").size(13).color(muted_text(&theme)));
         controls = controls.push(
             text_input("filter attributes…", &self.attribute_filter)
@@ -2100,80 +2091,9 @@ impl Viewer {
                 .padding(8)
                 .size(13)
                 .style(input_style)
-                .width(Length::Fixed(200.0)),
+                .width(Length::Fill),
         );
-
-        // Profile controls sit on the right of the bar: pick a saved profile,
-        // overwrite it, or save the current visible set under a new name.
-        let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
-        controls = controls.push(Space::with_width(Fill));
-        controls = controls.push(separator());
-        controls = controls.push(text("Profile").size(13).color(muted_text(&theme)));
-        controls = controls.push(
-            pick_list(
-                profile_names,
-                self.current_profile.clone(),
-                Message::ProfileSelected,
-            )
-            .placeholder("none")
-            .padding(8)
-            .text_size(13)
-            .style(pick_list_style),
-        );
-        if self.current_profile.is_some() {
-            controls = controls.push(
-                button(text("Save").size(13))
-                    .on_press(Message::SaveCurrentProfile)
-                    .padding([3, 8])
-                    .style(primary_button),
-            );
-            controls = controls.push(
-                button(text("clear").size(13))
-                    .on_press(Message::ClearProfile)
-                    .padding([3, 8])
-                    .style(ghost_button),
-            );
-        }
-        controls = controls.push(
-            button(text("Save as new…").size(13))
-                .on_press(Message::BeginSaveNewProfile)
-                .padding([3, 8])
-                .style(secondary_button),
-        );
-        if let Some(status) = &self.profile_status {
-            controls = controls.push(text(status.as_str()).size(12));
-        }
-        if let Some(status) = &self.index_status {
-            controls = controls.push(text(status.as_str()).size(12));
-        }
-        hidden_bar = hidden_bar.push(controls);
-
-        // Prompt for the name of a new profile.
-        if self.naming_profile {
-            hidden_bar = hidden_bar.push(
-                row![
-                    text("New profile name:").size(13).color(muted_text(&theme)),
-                    text_input("profile name", &self.new_profile_name)
-                        .on_input(Message::NewProfileNameChanged)
-                        .on_submit(Message::ConfirmSaveNewProfile)
-                        .padding(8)
-                        .size(13)
-                        .style(input_style)
-                        .width(Length::Fixed(200.0)),
-                    button(text("Save").size(13))
-                        .on_press(Message::ConfirmSaveNewProfile)
-                        .padding([3, 8])
-                        .style(primary_button),
-                    button(text("Cancel").size(13))
-                        .on_press(Message::CancelSaveNewProfile)
-                        .padding([3, 8])
-                        .style(ghost_button),
-                ]
-                .spacing(6)
-                .align_y(Center),
-            );
-        }
-
+        hidden_bar = hidden_bar.push(controls.wrap());
         // The hidden attribute names are sorted alphabetically so a large
         // attribute list stays easy to scan. The list is collapsed by default
         // (a long list would otherwise push the rows off screen); it opens when
@@ -2193,7 +2113,6 @@ impl Viewer {
                         .then_with(|| a.cmp(b))
                 });
                 let mut line = Row::new().spacing(6).align_y(Center);
-                let mut count = 0usize;
                 let mut shown = 0usize;
                 for index in indices {
                     let Some(name) = self.headers.get(index) else {
@@ -2201,11 +2120,6 @@ impl Viewer {
                     };
                     if searching && !attr_matches(&self.attribute_filter, name) {
                         continue;
-                    }
-                    if count == hidden_columns {
-                        hidden_bar = hidden_bar.push(line);
-                        line = Row::new().spacing(6).align_y(Center);
-                        count = 0;
                     }
                     // Mirror the visible chips: a database icon toggles the
                     // index and the eye reveals the attribute again.
@@ -2242,11 +2156,10 @@ impl Viewer {
                         .padding([3, 8])
                         .style(move |theme| chip_style(theme, false, indexed)),
                     );
-                    count += 1;
                     shown += 1;
                 }
                 if shown > 0 {
-                    hidden_bar = hidden_bar.push(line);
+                    hidden_bar = hidden_bar.push(line.wrap());
                 } else {
                     hidden_bar =
                         hidden_bar.push(text("no hidden attributes match the filter").size(13));
@@ -2254,12 +2167,110 @@ impl Viewer {
             }
         }
 
-        // The attribute/profile controls sit in their own card below the
-        // toolbar, so the search row keeps the full window width.
-        let controls_card = container(hidden_bar)
-            .width(Fill)
-            .padding([10, 12])
-            .style(card_style);
+        // Profile controls sit on the right of the bar: pick a saved profile,
+        // overwrite it, or save the current visible set under a new name.
+        let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
+        let mut profile_controls = Row::new().spacing(10).align_y(Center).width(Fill);
+        profile_controls = profile_controls.push(text("Profile").size(13).color(muted_text(&theme)));
+        profile_controls = profile_controls.push(
+            pick_list(
+                profile_names,
+                self.current_profile.clone(),
+                Message::ProfileSelected,
+            )
+            .placeholder("none")
+            .padding(8)
+            .text_size(13)
+            .style(pick_list_style),
+        );
+        if self.current_profile.is_some() {
+            profile_controls = profile_controls.push(
+                button(text("Save").size(13))
+                    .on_press(Message::SaveCurrentProfile)
+                    .padding([3, 8])
+                    .style(primary_button),
+            );
+            profile_controls = profile_controls.push(
+                button(text("clear").size(13))
+                    .on_press(Message::ClearProfile)
+                    .padding([3, 8])
+                    .style(ghost_button),
+            );
+        }
+        profile_controls = profile_controls.push(
+            button(text("Save as new…").size(13))
+                .on_press(Message::BeginSaveNewProfile)
+                .padding([3, 8])
+                .style(secondary_button),
+        );
+        if let Some(status) = &self.profile_status {
+            profile_controls = profile_controls.push(text(status.as_str()).size(12));
+        }
+        if let Some(status) = &self.index_status {
+            profile_controls = profile_controls.push(text(status.as_str()).size(12));
+        }
+        hidden_bar = hidden_bar.push(profile_controls.wrap());
+
+        // Prompt for the name of a new profile.
+        if self.naming_profile {
+            hidden_bar = hidden_bar.push(
+                row![
+                    text("New profile name:").size(13).color(muted_text(&theme)),
+                    text_input("profile name", &self.new_profile_name)
+                        .on_input(Message::NewProfileNameChanged)
+                        .on_submit(Message::ConfirmSaveNewProfile)
+                        .padding(8)
+                        .size(13)
+                        .style(input_style)
+                        .width(Length::Fixed(200.0)),
+                    button(text("Save").size(13))
+                        .on_press(Message::ConfirmSaveNewProfile)
+                        .padding([3, 8])
+                        .style(primary_button),
+                    button(text("Cancel").size(13))
+                        .on_press(Message::CancelSaveNewProfile)
+                        .padding([3, 8])
+                        .style(ghost_button),
+                ]
+                .spacing(6)
+                .align_y(Center),
+            );
+        }
+
+
+        // The configuration has its own docked panel: the scan/view options,
+        // the attribute controls, the profiles and the hidden attribute chips.
+        let config_header = row![
+            text(char::from(Bootstrap::Sliders))
+                .font(BOOTSTRAP_FONT)
+                .size(15)
+                .color(palette.primary.base.color),
+            text("Configuration").size(16),
+            Space::with_width(Fill),
+            button(text(char::from(Bootstrap::XLg)).font(BOOTSTRAP_FONT).size(14))
+                .on_press(Message::ToggleConfigPanel)
+                .padding([4, 8])
+                .style(ghost_button),
+        ]
+        .spacing(8)
+        .align_y(Center);
+
+        let config_panel: Element<'_, Message> = container(
+            column![
+                config_header,
+                scrollable(hidden_bar)
+                    .height(Fill)
+                    .width(Fill)
+                    .style(scrollbar_style),
+            ]
+            .spacing(10)
+            .height(Fill),
+        )
+        .width(Length::Fixed(panel_width))
+        .height(Fill)
+        .padding(12)
+        .style(sidebar_style)
+        .into();
 
         // Table geometry: each column keeps at least `TABLE_CELL_MIN_WIDTH`, so
         // the table grows horizontally instead of squeezing columns into the
@@ -2268,7 +2279,9 @@ impl Viewer {
         let column_widths: Vec<f32> = visible_columns
             .iter()
             .map(|&column| {
-                (self.header(column).chars().count() as f32 * CHAR_WIDTH + 24.0)
+                (self.header(column).chars().count() as f32 * CHAR_WIDTH
+                    + 24.0
+                    + TABLE_HEADER_CHROME)
                     .max(TABLE_CELL_MIN_WIDTH)
             })
             .collect();
@@ -2366,7 +2379,13 @@ impl Viewer {
                         Bootstrap::Unlock
                     };
                     let mut cell = row![
-                        text(self.header(column)).size(13).width(Fill),
+                        container(
+                            text(self.header(column))
+                                .size(14)
+                                .wrapping(Wrapping::None),
+                        )
+                        .width(Fill)
+                        .clip(true),
                         button(text(char::from(database)).font(BOOTSTRAP_FONT).size(14))
                             .on_press(Message::ToggleIndex(column))
                             .padding(2)
@@ -2423,7 +2442,7 @@ impl Viewer {
                     for (column_position, &column) in visible_columns.iter().enumerate() {
                         let cell = values.get(column).map(String::as_str).unwrap_or("");
                         line = line.push(
-                            container(text(cell).size(13).wrapping(Wrapping::None))
+                            container(text(cell).size(14).wrapping(Wrapping::None))
                                 .width(Length::Fixed(column_widths[column_position]))
                                 .clip(true)
                                 .padding([3, 10]),
@@ -2531,7 +2550,6 @@ impl Viewer {
         let main_col: Element<'_, Message> = column![
             toolbar,
             status_bar,
-            controls_card,
             container(
                 scrollable(list)
                     .id(self.scroll_id.clone())
@@ -2550,19 +2568,95 @@ impl Viewer {
         .height(Fill)
         .into();
 
-        // The rule panel is docked on the left and runs the full window height.
-        let content: Element<'_, Message> = if self.show_rules {
-            row![self.rules_sidebar(), main_col]
-                .spacing(8)
-                .width(Fill)
-                .height(Fill)
-                .into()
-        } else {
-            main_col
-        };
-        let content = container(content)
-            .padding(10)
+        // The rule panel docks on the left and the configuration panel on the
+        // right; the grid takes whatever width is left.
+        let mut body_row = Row::new()
+            .spacing(MAIN_GAP)
             .width(Fill)
+            .height(Fill);
+        if self.show_rules {
+            body_row = body_row.push(self.rules_sidebar());
+        }
+        body_row = body_row.push(main_col);
+        if self.show_config {
+            body_row = body_row.push(config_panel);
+        }
+        let content: Element<'_, Message> = body_row.into();
+        // The top bar spans the full window width; the body below keeps the
+        // canvas padding. The menu tabs mirror the toolbar's former buttons.
+        let tabs = row![
+            menu_tab(
+                Some(char::from(Bootstrap::FolderFill)),
+                "Open",
+                false,
+                Some(Message::OpenFile),
+                &theme
+            ),
+            menu_tab(
+                None,
+                "Rules",
+                self.show_rules,
+                Some(Message::ToggleRulesPanel),
+                &theme
+            ),
+            menu_tab(
+                None,
+                "Table",
+                self.table,
+                Some(Message::ToggleTable(!self.table)),
+                &theme
+            ),
+            menu_tab(
+                None,
+                "Index",
+                self.use_index && !self.indexes.is_empty(),
+                (!self.indexes.is_empty()).then_some(Message::ToggleUseIndex(!self.use_index)),
+                &theme,
+            ),
+        ]
+        .spacing(2)
+        .align_y(Center);
+
+        // Opens the configuration panel; filled while the panel is open.
+        let config_active = self.show_config;
+        let config_toggle = button(
+            text(char::from(Bootstrap::Sliders))
+                .font(BOOTSTRAP_FONT)
+                .size(14),
+        )
+        .on_press(Message::ToggleConfigPanel)
+        .padding([7, 10])
+        .style(move |theme: &Theme, status: button::Status| {
+            if config_active {
+                primary_button(theme, status)
+            } else {
+                secondary_button(theme, status)
+            }
+        });
+        let app_bar = container(
+            row![
+                brand,
+                separator(),
+                tabs,
+                Space::with_width(Fill),
+                container(text(file_name).size(13).color(muted_text(&theme)))
+                    .padding([4, 12])
+                    .style(badge_style),
+                config_toggle,
+            ]
+            .spacing(10)
+            .align_y(Center),
+        )
+        .padding([6, 14])
+        .width(Fill)
+        .style(app_bar_style);
+
+        let body = container(content)
+            .padding(CONTENT_PADDING)
+            .width(Fill)
+            .height(Fill);
+
+        let content: Element<'_, Message> = column![app_bar, body]
             .height(Fill)
             .into();
 
@@ -2764,9 +2858,9 @@ impl Viewer {
         let selected = active || collecting;
         let filter = if selected { self.rules.hits_filter } else { None };
         let caret = if selected {
-            Bootstrap::CaretDownFill
+            Bootstrap::CaretDown
         } else {
-            Bootstrap::CaretRightFill
+            Bootstrap::CaretRight
         };
 
         let name_button = button(
@@ -2812,6 +2906,19 @@ impl Viewer {
 
         // Statistics go on their own line: a long rule name in the narrow
         // sidebar must never squeeze them into one letter per line.
+        // The status pill rides on the title line, right-aligned, like the rule
+        // cards in the reference; the outcome counts get their own line below.
+        let title_row = row![
+            name_button,
+            container(text(status).size(11))
+                .padding([2, 8])
+                .style(move |theme: &Theme| status_badge_style(theme, status)),
+        ]
+        .spacing(6)
+        .align_y(Center);
+
+        // Statistics go on their own line: a long rule name in the narrow
+        // sidebar must never squeeze them into one letter per line.
         let stats = row![
             text(format!("checked {}", rule.rows_checked))
                 .size(12)
@@ -2820,15 +2927,12 @@ impl Viewer {
             failed_button,
             skipped_button,
             validation_skipped_button,
-            container(text(status).size(11))
-                .padding([2, 8])
-                .style(move |theme: &Theme| status_badge_style(theme, status)),
         ]
         .spacing(6)
         .align_y(Center)
         .wrap();
 
-        let mut card = column![name_button, stats].spacing(6).padding(8);
+        let mut card = column![title_row, stats].spacing(6).padding(8);
 
         if active {
             let label = match filter {
@@ -2889,18 +2993,19 @@ fn modern_theme() -> Theme {
 fn build_theme() -> Theme {
     let palette = if matches!(Theme::default(), Theme::Dark) {
         Palette {
-            background: Color::from_rgb(0.082, 0.090, 0.118),
+            background: Color::from_rgb(0.075, 0.086, 0.114),
             text: Color::from_rgb(0.902, 0.910, 0.937),
-            primary: Color::from_rgb(0.506, 0.463, 0.976),
+            primary: Color::from_rgb(0.376, 0.549, 0.980),
             success: Color::from_rgb(0.204, 0.780, 0.596),
             danger: Color::from_rgb(0.937, 0.353, 0.353),
         }
     } else {
         Palette {
-            background: Color::from_rgb(0.961, 0.965, 0.980),
-            text: Color::from_rgb(0.106, 0.122, 0.188),
-            primary: Color::from_rgb(0.310, 0.275, 0.898),
-            success: Color::from_rgb(0.020, 0.588, 0.412),
+            // Light app canvas (#F1F2F4) under white cards, like the reference.
+            background: Color::from_rgb(0.945, 0.949, 0.957),
+            text: Color::from_rgb(0.067, 0.094, 0.153),
+            primary: Color::from_rgb(0.145, 0.388, 0.922),
+            success: Color::from_rgb(0.086, 0.639, 0.290),
             danger: Color::from_rgb(0.863, 0.149, 0.149),
         }
     };
@@ -2916,33 +3021,57 @@ fn muted_text(theme: &Theme) -> Color {
     }
 }
 
+/// White surface used by the cards and the sidebar; slightly lifted in dark mode.
+fn surface_color(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgb(0.118, 0.129, 0.169)
+    } else {
+        Color::WHITE
+    }
+}
+
+/// Hairline border shared by cards, inputs and chips (#E5E7EB in light mode).
+fn hairline(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.10)
+    } else {
+        Color::from_rgb(0.898, 0.906, 0.922)
+    }
+}
+
+/// Very light fill used for badges, table headers and hovered rows.
+fn subtle_fill(theme: &Theme) -> Color {
+    if theme.extended_palette().is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.04)
+    } else {
+        Color::from_rgb(0.973, 0.976, 0.980)
+    }
+}
+
+/// A translucent tint of `color`. Selection states use this instead of an opaque
+/// paint so the surface behind a card, pill or row shows through.
+fn tint(color: Color, alpha: f32) -> Color {
+    Color { a: alpha, ..color }
+}
+
 /// Floating panel: white surface, hairline border and a soft drop shadow.
 fn card_style(theme: &Theme) -> container::Style {
     let dark = theme.extended_palette().is_dark;
-    let (surface, border, shadow) = if dark {
-        (
-            Color::from_rgb(0.118, 0.129, 0.169),
-            Color::from_rgba(1.0, 1.0, 1.0, 0.07),
-            Color::from_rgba(0.0, 0.0, 0.0, 0.35),
-        )
-    } else {
-        (
-            Color::WHITE,
-            Color::from_rgba(0.06, 0.09, 0.16, 0.08),
-            Color::from_rgba(0.06, 0.09, 0.16, 0.06),
-        )
-    };
     container::Style {
-        background: Some(Background::Color(surface)),
+        background: Some(Background::Color(surface_color(theme))),
         border: Border {
-            color: border,
+            color: hairline(theme),
             width: 1.0,
             radius: CARD_RADIUS.into(),
         },
         shadow: Shadow {
-            color: shadow,
+            color: if dark {
+                Color::from_rgba(0.0, 0.0, 0.0, 0.35)
+            } else {
+                Color::from_rgba(0.06, 0.09, 0.16, 0.04)
+            },
             offset: Vector::new(0.0, 1.0),
-            blur_radius: 6.0,
+            blur_radius: 8.0,
         },
         text_color: None,
     }
@@ -2950,13 +3079,12 @@ fn card_style(theme: &Theme) -> container::Style {
 
 /// Pill used for the file name and other small metadata badges.
 fn badge_style(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
     container::Style {
-        background: Some(Background::Color(palette.background.weak.color)),
+        background: Some(Background::Color(subtle_fill(theme))),
         border: Border {
-            color: palette.background.strong.color,
+            color: hairline(theme),
             width: 1.0,
-            radius: 6.0.into(),
+            radius: 999.0.into(),
         },
         ..container::Style::default()
     }
@@ -2965,21 +3093,21 @@ fn badge_style(theme: &Theme) -> container::Style {
 /// Rounded, softly tinted text input that highlights the accent while focused.
 fn input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let palette = theme.extended_palette();
+    let focused = matches!(status, text_input::Status::Focused);
     let background = if palette.is_dark {
         Color::from_rgba(1.0, 1.0, 1.0, 0.05)
     } else {
-        Color::from_rgb(0.973, 0.976, 0.988)
-    };
-    let border = if matches!(status, text_input::Status::Focused) {
-        palette.primary.base.color
-    } else {
-        palette.background.strong.color
+        Color::WHITE
     };
     text_input::Style {
         background: Background::Color(background),
         border: Border {
-            color: border,
-            width: 1.0,
+            color: if focused {
+                palette.primary.base.color
+            } else {
+                hairline(theme)
+            },
+            width: if focused { 1.5 } else { 1.0 },
             radius: RADIUS.into(),
         },
         icon: palette.background.base.text,
@@ -2992,20 +3120,43 @@ fn input_style(theme: &Theme, status: text_input::Status) -> text_input::Style {
 /// Solid accent button (Open, Search, Save).
 fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
     let mut style = button::primary(theme, status);
+    // The contrast helper can pick dark text on the accent blue; the reference
+    // style always uses white on the filled button.
+    style.text_color = Color::WHITE;
     style.border.radius = RADIUS.into();
     style.shadow = Shadow {
-        color: Color::from_rgba(0.0, 0.0, 0.0, 0.16),
+        color: Color::from_rgba(0.06, 0.09, 0.16, 0.10),
         offset: Vector::new(0.0, 1.0),
-        blur_radius: 4.0,
+        blur_radius: 3.0,
     };
     style
 }
 
-/// Quiet outlined button.
 fn secondary_button(theme: &Theme, status: button::Status) -> button::Style {
-    let mut style = button::secondary(theme, status);
-    style.border.radius = RADIUS.into();
-    style
+    let palette = theme.extended_palette();
+    let (background, text_color, border_color) = match status {
+        button::Status::Hovered | button::Status::Pressed => (
+            palette.primary.weak.color,
+            palette.primary.strong.color,
+            palette.primary.base.color,
+        ),
+        button::Status::Disabled => (subtle_fill(theme), muted_text(theme), hairline(theme)),
+        button::Status::Active => (
+            surface_color(theme),
+            palette.background.base.text,
+            hairline(theme),
+        ),
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color,
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: RADIUS.into(),
+        },
+        shadow: Shadow::default(),
+    }
 }
 
 /// Borderless button used for inline/icon actions.
@@ -3060,14 +3211,78 @@ fn separator() -> Element<'static, Message> {
     .into()
 }
 
-/// Table header cell background: indexed columns keep the success accent.
+/// Flat top bar: white surface with a hairline frame, no floating shadow.
+fn app_bar_style(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(surface_color(theme))),
+        border: Border {
+            color: hairline(theme),
+            width: 1.0,
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
+/// One tab in the top menu bar: a label with an accent underline when active.
+fn menu_tab<'a>(
+    icon: Option<char>,
+    label: &'a str,
+    active: bool,
+    on_press: Option<Message>,
+    theme: &Theme,
+) -> Element<'a, Message> {
+    let accent = theme.extended_palette().primary.base.color;
+    let has_icon = icon.is_some();
+    // Underline width is measured from the label (plus its icon) so the tabs
+    // pack tight instead of a `Fill` bar stretching them across the whole bar.
+    let width = (label.chars().count() as f32 * 6.4 + if has_icon { 20.0 } else { 0.0 })
+        .max(18.0);
+    let underline = container(Space::new(
+        Length::Fixed(width),
+        Length::Fixed(2.0),
+    ))
+    .style(move |_theme: &Theme| container::Style {
+        background: active.then_some(Background::Color(accent)),
+        border: Border {
+            radius: 1.0.into(),
+            ..Border::default()
+        },
+        ..container::Style::default()
+    });
+    let color = if active {
+        theme.extended_palette().background.base.text
+    } else {
+        muted_text(theme)
+    };
+    let mut title = Row::new().spacing(6).align_y(Center);
+    if let Some(icon) = icon {
+        title = title.push(
+            text(icon)
+                .font(BOOTSTRAP_FONT)
+                .size(13)
+                .color(color),
+        );
+    }
+    title = title.push(text(label).size(14).color(color));
+    let content = column![title, underline].spacing(5).align_x(Center);
+    let mut tab = button(content).padding([7, 14]).style(ghost_button);
+    if let Some(message) = on_press {
+        tab = tab.on_press(message);
+    }
+    tab.into()
+}
+
 fn header_cell_style(theme: &Theme, indexed: bool) -> container::Style {
     let palette = theme.extended_palette();
     container::Style {
         background: Some(Background::Color(if indexed {
-            palette.success.weak.color
+            tint(
+                palette.success.base.color,
+                if palette.is_dark { 0.20 } else { 0.12 },
+            )
         } else {
-            palette.background.weak.color
+            subtle_fill(theme)
         })),
         ..container::Style::default()
     }
@@ -3087,9 +3302,12 @@ fn row_button_style(
     let hovered = hover_highlight
         && matches!(status, button::Status::Hovered | button::Status::Pressed);
     let background = if hovered {
-        Some(Background::Color(palette.primary.weak.color))
+        Some(Background::Color(tint(
+            palette.primary.base.color,
+            if palette.is_dark { 0.18 } else { 0.10 },
+        )))
     } else if striped {
-        Some(Background::Color(palette.background.weak.color))
+        Some(Background::Color(subtle_fill(theme)))
     } else {
         None
     };
@@ -3241,15 +3459,15 @@ fn detail_form<'a>(
 
 /// Read-only field box used by the row detail form.
 fn input_like_style(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
+    let background = if theme.extended_palette().is_dark {
+        Color::from_rgba(1.0, 1.0, 1.0, 0.05)
+    } else {
+        subtle_fill(theme)
+    };
     container::Style {
-        background: Some(Background::Color(if palette.is_dark {
-            Color::from_rgba(1.0, 1.0, 1.0, 0.05)
-        } else {
-            Color::from_rgb(0.973, 0.976, 0.988)
-        })),
+        background: Some(Background::Color(background)),
         border: Border {
-            color: palette.background.strong.color,
+            color: hairline(theme),
             width: 1.0,
             radius: RADIUS.into(),
         },
@@ -3290,9 +3508,8 @@ fn scrollbar_style(theme: &Theme, _status: scrollable::Status) -> scrollable::St
 /// Divider between the toolbar and the rows. Kept for the table header
 /// separator, which sits between the sticky header and the first data row.
 fn divider_style(theme: &Theme) -> iced::widget::rule::Style {
-    let palette = theme.extended_palette();
     iced::widget::rule::Style {
-        color: palette.background.strong.color,
+        color: hairline(theme),
         width: 1,
         radius: 0.0.into(),
         fill_mode: iced::widget::rule::FillMode::Full,
@@ -3321,7 +3538,10 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
     let palette = theme.extended_palette();
     if indexed {
         return container::Style {
-            background: Some(Background::Color(palette.success.weak.color)),
+            background: Some(Background::Color(tint(
+                palette.success.base.color,
+                if palette.is_dark { 0.20 } else { 0.12 },
+            ))),
             border: Border {
                 color: palette.success.strong.color,
                 width: 1.5,
@@ -3332,7 +3552,10 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
     }
     if highlight {
         return container::Style {
-            background: Some(Background::Color(palette.primary.weak.color)),
+            background: Some(Background::Color(tint(
+                palette.primary.base.color,
+                if palette.is_dark { 0.22 } else { 0.12 },
+            ))),
             border: Border {
                 color: palette.primary.strong.color,
                 width: 1.5,
@@ -3344,7 +3567,7 @@ fn chip_style(theme: &Theme, highlight: bool, indexed: bool) -> container::Style
     container::Style {
         background: None,
         border: Border {
-            color: palette.background.strong.color,
+            color: hairline(theme),
             width: 1.0,
             radius: RADIUS.into(),
         },
@@ -3931,9 +4154,15 @@ fn scan_indexed(
 fn status_badge_style(theme: &Theme, status: &str) -> container::Style {
     let palette = theme.extended_palette();
     let (background, text) = if status == "passed" {
-        (palette.success.weak.color, palette.success.strong.color)
+        (
+            tint(palette.success.base.color, 0.16),
+            palette.success.strong.color,
+        )
     } else {
-        (palette.danger.weak.color, palette.danger.strong.color)
+        (
+            tint(palette.danger.base.color, 0.16),
+            palette.danger.strong.color,
+        )
     };
     container::Style {
         background: Some(Background::Color(background)),
@@ -3956,13 +4185,16 @@ fn filter_button_style(
     outcome: RowOutcome,
 ) -> button::Style {
     let palette = theme.extended_palette();
-    let (weak, strong) = outcome_colors(theme, outcome);
+    let (base, strong) = outcome_colors(theme, outcome);
     let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
     button::Style {
         background: if active {
-            Some(Background::Color(weak))
+            Some(Background::Color(tint(
+                base,
+                if palette.is_dark { 0.28 } else { 0.16 },
+            )))
         } else if hovered {
-            Some(Background::Color(palette.background.weak.color))
+            Some(Background::Color(subtle_fill(theme)))
         } else {
             None
         },
@@ -3984,14 +4216,14 @@ fn filter_button_style(
     }
 }
 
-/// The weak (fill) and strong (text/border) colours for a row outcome.
+/// The base (tinted fill) and strong (text/border) colours for a row outcome.
 fn outcome_colors(theme: &Theme, outcome: RowOutcome) -> (Color, Color) {
     let palette = theme.extended_palette();
     match outcome {
-        RowOutcome::Passed => (palette.success.weak.color, palette.success.strong.color),
-        RowOutcome::Failed => (palette.danger.weak.color, palette.danger.strong.color),
+        RowOutcome::Passed => (palette.success.base.color, palette.success.strong.color),
+        RowOutcome::Failed => (palette.danger.base.color, palette.danger.strong.color),
         RowOutcome::Skipped => (
-            palette.secondary.weak.color,
+            palette.secondary.base.color,
             palette.secondary.strong.color,
         ),
         RowOutcome::ValidationSkipped => (
@@ -4023,29 +4255,21 @@ fn outcome_button<'a>(
 /// tint so the panel makes the active filter obvious.
 fn rule_card_style(theme: &Theme, active: bool) -> container::Style {
     let palette = theme.extended_palette();
-    let surface = if palette.is_dark {
-        Color::from_rgba(1.0, 1.0, 1.0, 0.03)
-    } else {
-        Color::from_rgb(0.980, 0.984, 0.992)
-    };
     let (background, border_color, border_width) = if active {
         (
-            Color {
-                a: if palette.is_dark { 0.16 } else { 0.10 },
-                ..palette.primary.base.color
-            },
+            tint(palette.primary.base.color, if palette.is_dark { 0.22 } else { 0.12 }),
             palette.primary.base.color,
             1.5,
         )
     } else {
-        (surface, palette.background.strong.color, 1.0)
+        (subtle_fill(theme), hairline(theme), 1.0)
     };
     container::Style {
         background: Some(Background::Color(background)),
         border: Border {
             color: border_color,
             width: border_width,
-            radius: RADIUS.into(),
+            radius: CARD_RADIUS.into(),
         },
         ..container::Style::default()
     }
@@ -4054,14 +4278,7 @@ fn rule_card_style(theme: &Theme, active: bool) -> container::Style {
 /// Background of the left rule panel. Tinted a little darker than the floating
 /// cards it contains so the two surfaces read as a hierarchy.
 fn sidebar_style(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-    let mut style = card_style(theme);
-    style.background = Some(Background::Color(if palette.is_dark {
-        Color::from_rgb(0.098, 0.107, 0.141)
-    } else {
-        Color::from_rgb(0.969, 0.973, 0.984)
-    }));
-    style
+    card_style(theme)
 }
 
 fn parse_delimiter(raw: &str) -> Result<u8, String> {
