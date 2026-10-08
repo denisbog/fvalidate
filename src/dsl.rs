@@ -165,16 +165,48 @@ pub enum MappingSourceDef {
     None,
     /// Extract the left -> right mapping from the data itself.
     Auto,
-    /// Load one or more reference files.
-    Files {
-        files: Vec<PathBuf>,
-        /// One or more columns forming the lookup key.
-        left: Vec<String>,
-        /// One or more columns forming the target value.
-        right: Vec<String>,
-        multi: bool,
-        separator: Option<Separator>,
-    },
+    /// One or more ordered reference sources. Lookups are resolved against
+    /// them in order, so a later source can fill in values the earlier ones
+    /// could not resolve (see [`FallbackMode`]).
+    Files(Vec<MappingSource>),
+}
+
+/// One `mapping { ... }` block: a set of reference files plus the columns
+/// used to key them. Each source may key on different input columns, which is
+/// what allows a fallback lookup from another file.
+#[derive(Debug, Clone, Default)]
+pub struct MappingSource {
+    pub files: Vec<PathBuf>,
+    /// Reference-file column(s) forming the lookup key.
+    pub left: Vec<String>,
+    /// Reference-file column(s) forming the target value.
+    pub right: Vec<String>,
+    /// Data-row key: a column, a composite `[a, b]` or a fallback
+    /// `or(a, b, c)`. Defaults to `left` (same names) for a `mapping { ... }`
+    /// block, or to the rule's `left` for the legacy `mapping_files` keys.
+    pub key: Option<ColumnSpec>,
+    /// Set for sources built from the legacy `mapping_files`/`mapping_left`
+    /// keys, where an omitted `key` falls back to the rule's `left` columns.
+    pub key_from_rule: bool,
+    pub multi: bool,
+    pub separator: Option<Separator>,
+    /// Optional predicate over reference rows; columns resolve against each
+    /// file's own header.
+    pub filter: Option<Predicate>,
+    /// When to consult the next source instead of using this one.
+    pub when: FallbackMode,
+}
+
+/// Controls when the next mapping source is tried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FallbackMode {
+    /// Use the next source only when this one has no entry for the key.
+    #[default]
+    Unmapped,
+    /// Also use the next source when this one is ambiguous.
+    Ambiguous,
+    /// Always use the next source (a later source overrides an earlier one).
+    Always,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +295,8 @@ pub fn parse(text: &str) -> Result<Program, String> {
 
     let mut module: Option<Module> = None;
     let mut current_rule: Option<RuleDef> = None;
+    // Set while inside a `mapping { ... }` sub-block of a rule.
+    let mut current_mapping: Option<MappingSource> = None;
     let mut accumulator = String::new();
     let mut line_no = 0usize;
     // Carried across lines so a `#` inside a multi-line quoted value is not
@@ -319,6 +353,14 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     mapping: MappingSourceDef::None,
                     report_limit: None,
                 });
+            } else if header == "mapping" {
+                if module != Some(Module::Rule) {
+                    return Err(format!("line {line_no}: unexpected block '{header}'"));
+                }
+                if current_mapping.is_some() {
+                    return Err(format!("line {line_no}: nested `mapping` block"));
+                }
+                current_mapping = Some(MappingSource::default());
             } else {
                 return Err(format!("line {line_no}: unexpected block '{header}'"));
             }
@@ -326,6 +368,17 @@ pub fn parse(text: &str) -> Result<Program, String> {
         }
 
         if statement == "}" {
+            // A `}` closes the innermost `mapping { ... }` block when one is
+            // open, otherwise it closes the current `rule`/`defaults` block.
+            if let Some(source) = current_mapping.take() {
+                match current_rule.as_mut() {
+                    Some(rule) => push_mapping_source(&mut rule.mapping, source),
+                    None => {
+                        return Err(format!("line {line_no}: mapping block outside a rule"));
+                    }
+                }
+                continue;
+            }
             if let Some(rule) = current_rule.take() {
                 rules.push(validate_rule(rule, line_no)?);
             }
@@ -339,18 +392,22 @@ pub fn parse(text: &str) -> Result<Program, String> {
         let key = key.trim();
         let value = parse_value(value.trim()).map_err(|e| format!("line {line_no}: {e}"))?;
 
-        match module {
-            Some(Module::Defaults) => apply_default(&mut defaults, key, &value, line_no)?,
-            Some(Module::Rule) => {
-                let rule = current_rule
-                    .as_mut()
-                    .ok_or_else(|| format!("line {line_no}: assignment outside a rule"))?;
-                apply_rule_key(rule, key, &value, line_no)?;
-            }
-            None => {
-                return Err(format!(
-                    "line {line_no}: assignment `{key}` outside of a block"
-                ))
+        if let Some(source) = current_mapping.as_mut() {
+            apply_mapping_key(source, key, &value, line_no)?;
+        } else {
+            match module {
+                Some(Module::Defaults) => apply_default(&mut defaults, key, &value, line_no)?,
+                Some(Module::Rule) => {
+                    let rule = current_rule
+                        .as_mut()
+                        .ok_or_else(|| format!("line {line_no}: assignment outside a rule"))?;
+                    apply_rule_key(rule, key, &value, line_no)?;
+                }
+                None => {
+                    return Err(format!(
+                        "line {line_no}: assignment `{key}` outside of a block"
+                    ))
+                }
             }
         }
     }
@@ -368,9 +425,61 @@ pub fn parse(text: &str) -> Result<Program, String> {
     Ok(Program { defaults, rules })
 }
 
-fn validate_rule(rule: RuleDef, line_no: usize) -> Result<RuleDef, String> {
+fn validate_rule(mut rule: RuleDef, line_no: usize) -> Result<RuleDef, String> {
+    let _ = line_no;
+
+    // Finalize each mapping source: fill in the missing side of the
+    // reference/data key pair so a block can name only the columns that differ.
+    if let MappingSourceDef::Files(sources) = &mut rule.mapping {
+        for source in sources.iter_mut() {
+            if source.left.is_empty() && source.key.is_none() {
+                return Err(format!(
+                    "rule '{}': a mapping source needs `left` (reference columns) or `key` (data columns)",
+                    rule.name
+                ));
+            }
+            if source.right.is_empty() {
+                return Err(format!(
+                    "rule '{}': a mapping source needs `right` (reference target columns)",
+                    rule.name
+                ));
+            }
+            if source.key.is_none() {
+                // A `mapping { ... }` block keys the data by the same column
+                // names as the reference; the legacy `mapping_files` keys key
+                // by the rule's `left` columns (preserving `or(...)`).
+                source.key = if source.key_from_rule && !rule.left.is_empty() {
+                    Some(rule.left.clone())
+                } else {
+                    Some(ColumnSpec::Columns(source.left.clone()))
+                };
+            }
+            if source.left.is_empty() {
+                match &source.key {
+                    Some(ColumnSpec::Columns(names)) => source.left = names.clone(),
+                    _ => {
+                        return Err(format!(
+                            "rule '{}': a mapping source needs `left` (reference columns)",
+                            rule.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
     if rule.left.is_empty() {
-        return Err(format!("rule '{}': `left` column is required", rule.name));
+        match &rule.mapping {
+            MappingSourceDef::Files(sources) if !sources.is_empty() => {
+                rule.left = sources[0]
+                    .key
+                    .clone()
+                    .expect("mapping source key is finalized above");
+            }
+            _ => {
+                return Err(format!("rule '{}': `left` column is required", rule.name));
+            }
+        }
     }
     if rule.right.is_empty() && rule.pattern.is_none() {
         return Err(format!(
@@ -378,8 +487,16 @@ fn validate_rule(rule: RuleDef, line_no: usize) -> Result<RuleDef, String> {
             rule.name
         ));
     }
-    let _ = line_no;
     Ok(rule)
+}
+
+/// Append a `mapping { ... }` block to a rule's mapping, creating the ordered
+/// source list on first use.
+fn push_mapping_source(mapping: &mut MappingSourceDef, source: MappingSource) {
+    match mapping {
+        MappingSourceDef::Files(sources) => sources.push(source),
+        _ => *mapping = MappingSourceDef::Files(vec![source]),
+    }
 }
 
 fn apply_default(
@@ -455,49 +572,35 @@ fn apply_rule_key(
                 .into_iter()
                 .map(PathBuf::from)
                 .collect();
-            rule.mapping = MappingSourceDef::Files {
-                files,
-                left: match &rule.mapping {
-                    MappingSourceDef::Files { left, .. } => left.clone(),
-                    _ => Vec::new(),
-                },
-                right: match &rule.mapping {
-                    MappingSourceDef::Files { right, .. } => right.clone(),
-                    _ => Vec::new(),
-                },
-                multi: match &rule.mapping {
-                    MappingSourceDef::Files { multi, .. } => *multi,
-                    _ => false,
-                },
-                separator: match &rule.mapping {
-                    MappingSourceDef::Files { separator, .. } => separator.clone(),
-                    _ => None,
-                },
+            // Legacy keys build (or update) a single source whose data-side
+            // key defaults to the rule's `left` columns.
+            let mut source = match &rule.mapping {
+                MappingSourceDef::Files(sources) if sources.len() == 1 => sources[0].clone(),
+                _ => MappingSource::default(),
             };
+            source.files = files;
+            source.key_from_rule = true;
+            rule.mapping = MappingSourceDef::Files(vec![source]);
         }
-        "mapping_left" | "mapping_right" | "mapping_multi" | "mapping_separator" => {
-            if !matches!(rule.mapping, MappingSourceDef::Files { .. }) {
-                rule.mapping = MappingSourceDef::Files {
-                    files: Vec::new(),
-                    left: Vec::new(),
-                    right: Vec::new(),
-                    multi: false,
-                    separator: None,
-                };
+        "mapping_left" | "mapping_right" | "mapping_multi" | "mapping_separator"
+        | "mapping_key" => {
+            if !matches!(rule.mapping, MappingSourceDef::Files(_)) {
+                rule.mapping = MappingSourceDef::Files(vec![MappingSource::default()]);
             }
-            if let MappingSourceDef::Files {
-                left,
-                right,
-                multi,
-                separator,
-                ..
-            } = &mut rule.mapping
-            {
+            if let MappingSourceDef::Files(sources) = &mut rule.mapping {
+                if sources.is_empty() {
+                    sources.push(MappingSource::default());
+                }
+                let source = &mut sources[0];
+                source.key_from_rule = true;
                 match key {
-                    "mapping_left" => *left = expect_string_or_list(value, key, line_no)?,
-                    "mapping_right" => *right = expect_string_or_list(value, key, line_no)?,
-                    "mapping_multi" => *multi = expect_bool(value, key, line_no)?,
-                    "mapping_separator" => *separator = Some(parse_separator(value, key, line_no)?),
+                    "mapping_left" => source.left = expect_string_or_list(value, key, line_no)?,
+                    "mapping_right" => source.right = expect_string_or_list(value, key, line_no)?,
+                    "mapping_multi" => source.multi = expect_bool(value, key, line_no)?,
+                    "mapping_separator" => {
+                        source.separator = Some(parse_separator(value, key, line_no)?)
+                    }
+                    "mapping_key" => source.key = Some(expect_columns(value, key, line_no)?),
                     _ => unreachable!(),
                 }
             }
@@ -505,6 +608,48 @@ fn apply_rule_key(
         other => return Err(format!("line {line_no}: unknown rule key `{other}`")),
     }
     Ok(())
+}
+
+/// Apply one `key = value` assignment inside a `mapping { ... }` block.
+fn apply_mapping_key(
+    source: &mut MappingSource,
+    key: &str,
+    value: &Value,
+    line_no: usize,
+) -> Result<(), String> {
+    match key {
+        "files" | "file" => {
+            source.files = expect_string_list(value, key, line_no)?
+                .into_iter()
+                .map(PathBuf::from)
+                .collect();
+        }
+        "left" | "mapping_left" => source.left = expect_string_or_list(value, key, line_no)?,
+        "right" | "mapping_right" => source.right = expect_string_or_list(value, key, line_no)?,
+        "key" | "data" | "columns" | "mapping_key" => {
+            source.key = Some(expect_columns(value, key, line_no)?)
+        }
+        "multi" | "mapping_multi" => source.multi = expect_bool(value, key, line_no)?,
+        "separator" | "mapping_separator" => {
+            source.separator = Some(parse_separator(value, key, line_no)?)
+        }
+        "filter" | "mapping_filter" => source.filter = Some(parse_predicate(value, key, line_no)?),
+        "when" | "on" | "fallback" => source.when = parse_fallback_mode(value, line_no)?,
+        other => return Err(format!("line {line_no}: unknown mapping key `{other}`")),
+    }
+    Ok(())
+}
+
+fn parse_fallback_mode(value: &Value, line_no: usize) -> Result<FallbackMode, String> {
+    let raw = expect_string_ref(value, "when", line_no)?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "unmapped" | "missing" | "not_found" | "" => Ok(FallbackMode::Unmapped),
+        "ambiguous" => Ok(FallbackMode::Ambiguous),
+        "always" | "override" => Ok(FallbackMode::Always),
+        other => Err(format!(
+            "line {line_no}: `when` must be `unmapped`, `ambiguous` or `always`, got `{other}`"
+        )),
+    }
 }
 
 fn expect_string(value: &Value, key: &str, line_no: usize) -> Result<String, String> {
@@ -1237,12 +1382,13 @@ mod tests {
         assert_eq!(program.rules[0].transform_left.len(), 2);
         assert!(matches!(program.rules[0].mapping, MappingSourceDef::Auto));
         match &program.rules[1].mapping {
-            MappingSourceDef::Files {
-                files, left, right, ..
-            } => {
-                assert_eq!(files.len(), 2);
-                assert_eq!(left, &["name".to_string()]);
-                assert_eq!(right, &["code".to_string()]);
+            MappingSourceDef::Files(sources) => {
+                let source = &sources[0];
+                assert_eq!(source.files.len(), 2);
+                assert_eq!(source.left, &["name".to_string()]);
+                assert_eq!(source.right, &["code".to_string()]);
+                // Legacy `mapping_left` keys the data by the rule's `left`.
+                assert_eq!(source.key, Some(ColumnSpec::Columns(vec!["c".to_string()])));
             }
             _ => panic!("expected files mapping"),
         }
@@ -1277,9 +1423,17 @@ mod tests {
         assert_eq!(rule.right, ColumnSpec::Columns(vec!["c".into()]));
         assert_eq!(rule.join_separator.as_deref(), Some("|"));
         match &rule.mapping {
-            MappingSourceDef::Files { left, right, .. } => {
-                assert_eq!(left, &["x".to_string(), "y".to_string()]);
-                assert_eq!(right, &["z".to_string()]);
+            MappingSourceDef::Files(sources) => {
+                let source = &sources[0];
+                assert_eq!(source.left, &["x".to_string(), "y".to_string()]);
+                assert_eq!(source.right, &["z".to_string()]);
+                assert_eq!(
+                    source.key,
+                    Some(ColumnSpec::Columns(vec![
+                        "a".to_string(),
+                        "b".to_string()
+                    ]))
+                );
             }
             _ => panic!("expected files mapping"),
         }

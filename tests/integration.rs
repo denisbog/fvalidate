@@ -231,6 +231,58 @@ fn cascading_mapping_accepts_any_target_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `mapping { ... }` blocks are consulted in order: a value missing from the
+/// first source is resolved by the next, which may key on other input columns.
+#[test]
+fn fallback_mapping_sources_use_different_input_columns() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-fallback-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let city_ref = dir.join("city.csv");
+    let area_ref = dir.join("area.csv");
+    let rules_path = dir.join("r.vl");
+    std::fs::write(
+        &csv_path,
+        "id,city,area,code\n1,Paris,IDF,PAR\n2,Berlin,BE,BER\n3,Lyon,ARA,LYO\n4,Nowhere,XX,ZZZ\n5,Paris,IDF,PAR2\n",
+    )
+    .unwrap();
+    std::fs::write(&city_ref, "city,code\nParis,PAR\nLyon,LYO\n").unwrap();
+    std::fs::write(&area_ref, "city,area,code\nParis,IDF,PAR2\nBerlin,BE,BER\n").unwrap();
+    std::fs::write(
+        &rules_path,
+        format!(
+            "rule \"fallback\" {{\n  right = code\n  mapping {{\n    files = [\"{city}\"]\n    left = city\n    right = code\n  }}\n  mapping {{\n    files = [\"{area}\"]\n    left = [city, area]\n    right = code\n  }}\n}}\n",
+            city = city_ref.display(),
+            area = area_ref.display(),
+        ),
+    )
+    .unwrap();
+
+    let report = run_json(&[
+        &csv_path.display().to_string(),
+        "-r",
+        &rules_path.display().to_string(),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+
+    let rule = &report["rules"].as_array().unwrap()[0];
+    // Paris and Lyon resolve in the first source; Berlin falls through to the
+    // `city + area` source.
+    assert_eq!(rule["rows_passed"], 3);
+    // Nowhere is in neither source (unmapped); Paris resolves in the first
+    // source and disagrees, so the fallback is never consulted for it.
+    assert_eq!(rule["rows_failed"], 2);
+    assert_eq!(rule["unmapped_values"], 1);
+    // The rule is labelled with the primary (first) source's key.
+    assert_eq!(rule["left"], "city");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// When the rule's `right` is a list of columns, the reference
 /// `mapping_right` columns form a composite value to match.
 #[test]
@@ -646,6 +698,7 @@ fn engine_collects_all_hits_and_rule_columns() {
         progress: None,
         collect_hits: Some(0),
         collect_hits_limit: usize::MAX,
+        collect_distinct: false,
     };
 
     let report = engine::run(&plan, &config).unwrap();
@@ -680,6 +733,70 @@ fn engine_collects_all_hits_and_rule_columns() {
     )
     .unwrap();
     assert!(plain.rules[0].hits.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `collect_distinct` samples across failure conditions: each distinct
+/// `(left, right, expected)` is capped at `collect_hits_limit / 10` rows, so a
+/// repeated failure cannot crowd out the others.
+#[test]
+fn engine_collect_distinct_samples_each_condition() {
+    use fast_csv::engine::{self, EngineConfig};
+    use fast_csv::{dsl, rules};
+
+    let dir = std::env::temp_dir().join(format!("fvalidate-distinct-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv_path = dir.join("data.csv");
+    let rules_path = dir.join("rules.vl");
+
+    let mut csv = String::from("id,a,b\n");
+    for index in 0..100 {
+        csv.push_str(&format!("{index},x,y\n"));
+    }
+    for index in 100..105 {
+        csv.push_str(&format!("{index},p{index},q{index}\n"));
+    }
+    std::fs::write(&csv_path, csv).unwrap();
+    std::fs::write(
+        &rules_path,
+        "rule \"eq\" {\n  left = a\n  right = b\n  mapping = none\n}\n",
+    )
+    .unwrap();
+
+    let headers = engine::read_headers(&csv_path, b',').unwrap();
+    let program = dsl::load_file(&rules_path).unwrap();
+    let plan = rules::compile(program, &headers).unwrap();
+    let report = engine::run(
+        &plan,
+        &EngineConfig {
+            path: csv_path.clone(),
+            delimiter: b',',
+            threads: 1,
+            id_idx: Some(0),
+            progress: None,
+            collect_hits: Some(0),
+            collect_hits_limit: 100,
+            collect_distinct: true,
+        },
+    )
+    .unwrap();
+
+    let hits = &report.rules[0].hits;
+    let repeated = hits
+        .iter()
+        .filter(|hit| hit.left == "x" && hit.right == "y")
+        .count();
+    assert_eq!(repeated, 10, "a repeated condition is capped at limit/10");
+
+    // x|y plus the five distinct conditions are all represented.
+    let mut conditions: Vec<(&str, &str)> = hits
+        .iter()
+        .map(|hit| (hit.left.as_str(), hit.right.as_str()))
+        .collect();
+    conditions.sort_unstable();
+    conditions.dedup();
+    assert_eq!(conditions.len(), 6);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -721,6 +838,7 @@ fn engine_collects_skipped_and_validation_skipped_hits() {
             progress: None,
             collect_hits: Some(0),
             collect_hits_limit: usize::MAX,
+            collect_distinct: false,
         },
     )
     .unwrap();
@@ -788,6 +906,7 @@ fn collect_hits_is_capped_per_outcome() {
             progress: None,
             collect_hits: Some(0),
             collect_hits_limit: 2,
+            collect_distinct: false,
         },
     )
     .unwrap();

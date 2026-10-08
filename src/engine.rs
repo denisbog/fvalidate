@@ -34,7 +34,10 @@ use crate::report::{
     AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RowHit,
     RowOutcome, RuleReport, TargetExample,
 };
-use crate::rules::{ColumnRef, CompiledPredicate, MappingPlan, Plan};
+use crate::dsl::FallbackMode;
+use crate::rules::{
+    ColumnRef, CompiledPredicate, CompiledRule, MappingPlan, MappingSourcePlan, Plan,
+};
 use crate::sampler::{fnv1a, Sampler};
 use crate::transform::{compose, Transform};
 
@@ -57,6 +60,11 @@ pub struct EngineConfig {
     /// passed / failed / skipped" can each display that many rows without
     /// materializing the whole rule. Use `usize::MAX` to keep every row.
     pub collect_hits_limit: usize,
+    /// When true, `collect_hits` retains a row only if its
+    /// `(left, right, expected)` condition has fewer than
+    /// `collect_hits_limit / 10` rows so far. This samples *distinct* outcomes
+    /// instead of filling the budget with rows that all failed the same way.
+    pub collect_distinct: bool,
 }
 
 /// Read the header row of the main input.
@@ -266,13 +274,20 @@ struct RuleAccum {
     /// How many hits of each outcome `hits` currently holds, indexed by
     /// `RowOutcome::index`.
     hits_collected: [usize; 4],
+    /// When true, retained hits are capped per `(left, right, expected)`
+    /// condition, not only per outcome.
+    distinct: bool,
+    /// Rows kept per distinct condition (see `EngineConfig::collect_distinct`).
+    distinct_limit: usize,
+    /// Per outcome, how many rows each condition has already contributed.
+    condition_counts: [HashMap<GroupKey, usize>; 4],
     /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
     /// reported.
     ambiguous_samples: Sampler<Example>,
 }
 
 impl RuleAccum {
-    fn new(limit: usize, hits_limit: usize) -> Self {
+    fn new(limit: usize, hits_limit: usize, distinct: bool) -> Self {
         RuleAccum {
             checked: 0,
             passed: 0,
@@ -287,6 +302,15 @@ impl RuleAccum {
             hits: Vec::new(),
             hits_limit,
             hits_collected: [0; 4],
+            distinct,
+            // At most a tenth of the budget per condition, so up to ten
+            // distinct conditions are represented.
+            distinct_limit: if distinct {
+                (hits_limit / 10).max(1)
+            } else {
+                usize::MAX
+            },
+            condition_counts: std::array::from_fn(|_| HashMap::new()),
             ambiguous_samples: Sampler::new(limit),
         }
     }
@@ -296,9 +320,42 @@ impl RuleAccum {
         self.hits_collected[outcome.index()] < self.hits_limit
     }
 
-    /// Record a hit and count it against the per-outcome cap.
+    /// Whether a hit for this condition fits under the per-outcome cap and, in
+    /// distinct mode, under the per-condition cap.
+    fn wants_condition(
+        &self,
+        outcome: RowOutcome,
+        left: &str,
+        right: &str,
+        expected: Option<&str>,
+    ) -> bool {
+        if !self.wants_hit(outcome) {
+            return false;
+        }
+        if !self.distinct {
+            return true;
+        }
+        let key = (
+            left.to_string(),
+            right.to_string(),
+            expected.map(str::to_string),
+        );
+        self.condition_counts[outcome.index()]
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            < self.distinct_limit
+    }
+
+    /// Record a hit and count it against the per-outcome and per-condition caps.
     fn push_hit(&mut self, hit: RowHit) {
         self.hits_collected[hit.outcome.index()] += 1;
+        if self.distinct {
+            let key = (hit.left.clone(), hit.right.clone(), hit.expected.clone());
+            *self.condition_counts[hit.outcome.index()]
+                .entry(key)
+                .or_insert(0) += 1;
+        }
         self.hits.push(hit);
     }
 
@@ -316,7 +373,12 @@ impl RuleAccum {
         // Another pass may have hit the cap for an outcome; only keep what still
         // fits, preserving file order across the merged segments.
         for hit in other.hits {
-            if self.wants_hit(hit.outcome) {
+            if self.wants_condition(
+                hit.outcome,
+                &hit.left,
+                &hit.right,
+                hit.expected.as_deref(),
+            ) {
                 self.push_hit(hit);
             }
         }
@@ -350,6 +412,11 @@ impl Slots {
         for rule in &plan.rules {
             rule.left.collect_columns(&mut needed);
             rule.right.collect_columns(&mut needed);
+            if let MappingPlan::Files(sources) = &rule.mapping {
+                for source in sources {
+                    source.key.collect_columns(&mut needed);
+                }
+            }
             if let Some(predicate) = &rule.skip {
                 predicate.collect_indices(&mut needed);
             }
@@ -675,18 +742,19 @@ fn validate_segment(
     path: &Path,
     delimiter: u8,
     rules: &[crate::rules::CompiledRule],
-    mappings: &[Option<Arc<Mapping>>],
+    mappings: &[Vec<Arc<Mapping>>],
     slots: &Slots,
     from: u64,
     to: u64,
     row_base: Option<u64>,
     collect_hits: Option<usize>,
     hits_limit: usize,
+    distinct: bool,
     progress: Option<&Arc<Progress>>,
 ) -> Result<Vec<RuleAccum>, String> {
     let mut accums: Vec<RuleAccum> = rules
         .iter()
-        .map(|rule| RuleAccum::new(rule.report_limit, hits_limit))
+        .map(|rule| RuleAccum::new(rule.report_limit, hits_limit, distinct))
         .collect();
     let mut reader = open_segment(path, delimiter, from, to, progress)?;
     let mut record = ByteRecord::new();
@@ -761,7 +829,14 @@ fn validate_segment(
                         if !accum.skip_results.is_disabled() {
                             accum.skip_results.observe(&left_buf, &right_buf, None, &id);
                         }
-                        if want_hit {
+                        if want_hit
+                            && accum.wants_condition(
+                                RowOutcome::ValidationSkipped,
+                                &left_buf,
+                                &right_buf,
+                                None,
+                            )
+                        {
                             accum.push_hit(RowHit {
                                 id,
                                 row: row_number,
@@ -777,18 +852,10 @@ fn validate_segment(
                 }
             }
 
-            let left_ok = compose_side(
-                &rule.left,
-                &cells,
-                slots,
-                &derived,
-                &rule.transform_left,
-                &rule.join_separator,
-                rule.trim,
-                &mut component_buf,
-                &mut component_buf2,
-                &mut left_buf,
-            );
+            let rule_mappings = &mappings[rule_index];
+            let is_file_mapping =
+                matches!(rule.mapping, MappingPlan::Files(_)) && !rule_mappings.is_empty();
+
             let right_ok = compose_side(
                 &rule.right,
                 &cells,
@@ -801,6 +868,41 @@ fn validate_segment(
                 &mut component_buf2,
                 &mut right_buf,
             );
+
+            // A file mapping composes the key of whichever source decides the
+            // lookup (in the branch below). Every other rule keys on `left`.
+            let mut left_ok = true;
+            if !is_file_mapping {
+                left_ok = compose_side(
+                    &rule.left,
+                    &cells,
+                    slots,
+                    &derived,
+                    &rule.transform_left,
+                    &rule.join_separator,
+                    rule.trim,
+                    &mut component_buf,
+                    &mut component_buf2,
+                    &mut left_buf,
+                );
+            } else if rule.allow_empty {
+                // The optional-relation check needs the first source's key; the
+                // lookup loop recomposes it for each source.
+                if let MappingPlan::Files(sources) = &rule.mapping {
+                    left_ok = compose_side(
+                        &sources[0].key,
+                        &cells,
+                        slots,
+                        &derived,
+                        &rule.transform_left,
+                        &rule.join_separator,
+                        rule.trim,
+                        &mut component_buf,
+                        &mut component_buf2,
+                        &mut left_buf,
+                    );
+                }
+            }
             // Optional relation: when both the source and the target are empty
             // the row is skipped instead of being reported as a failure. For
             // pattern rules there is no target, so an empty value is skipped.
@@ -810,7 +912,14 @@ fn validate_segment(
             {
                 accum.checked += 1;
                 accum.skipped += 1;
-                if collect_hits == Some(rule_index) && accum.wants_hit(RowOutcome::Skipped) {
+                if collect_hits == Some(rule_index)
+                    && accum.wants_condition(
+                        RowOutcome::Skipped,
+                        &left_buf,
+                        &right_buf,
+                        None,
+                    )
+                {
                     let id = row_id(slots, &cells, row_number, local_row);
                     accum.push_hit(RowHit {
                         id,
@@ -829,7 +938,7 @@ fn validate_segment(
             // decides the outcome, mirroring xan's `match(value, regex(...))`.
             let id = row_id(slots, &cells, row_number, local_row);
 
-            let mapping = mappings[rule_index].as_deref();
+            let mut mapping: Option<&Mapping> = rule_mappings.first().map(Arc::as_ref);
             let mut expected: &[String];
             let mut matched;
 
@@ -841,7 +950,6 @@ fn validate_segment(
                 };
                 expected = &[];
             } else {
-                fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
                 fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
 
                 // Multi-target file mappings list several acceptable values for
@@ -850,61 +958,94 @@ fn validate_segment(
                 // after the right tokens are normalized.
                 let mut multi_target = false;
                 let mut had_unmapped = false;
-                if let Some(mapping) = mapping {
-                    let mut count = 0usize;
-                    for token in &left_tokens {
-                        if mapping.multi_target {
-                            let targets = mapping.targets_for(token);
-                            if targets.is_empty() {
-                                accum.unmapped += 1;
-                                had_unmapped = true;
-                                // `\u{0}` cannot appear in a real target, so
-                                // this sentinel can never accidentally match.
-                                let slot = token_slot(&mut expected_buf, count);
-                                slot.push('\u{0}');
-                                slot.push_str(token);
-                                count += 1;
-                            } else {
-                                for (target, _) in targets {
-                                    token_slot(&mut expected_buf, count).push_str(target);
+                if is_file_mapping {
+                    let sources = match &rule.mapping {
+                        MappingPlan::Files(sources) => sources.as_slice(),
+                        _ => &[],
+                    };
+                    let (key_ok, chosen, multi, unmapped) = resolve_file_sources(
+                        sources,
+                        rule_mappings,
+                        rule,
+                        &cells,
+                        slots,
+                        &derived,
+                        &right_buf,
+                        &id,
+                        row_number,
+                        &mut component_buf,
+                        &mut component_buf2,
+                        &mut left_buf,
+                        &mut left_tokens,
+                        &mut expected_buf,
+                        accum,
+                    );
+                    left_ok &= key_ok;
+                    mapping = chosen;
+                    multi_target = multi;
+                    had_unmapped = unmapped;
+                    expected = &expected_buf;
+                } else {
+                    fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
+                    if let Some(current) = mapping {
+                        let mut count = 0usize;
+                        for token in &left_tokens {
+                            if current.multi_target {
+                                let targets = current.targets_for(token);
+                                if targets.is_empty() {
+                                    accum.unmapped += 1;
+                                    had_unmapped = true;
+                                    // `\u{0}` cannot appear in a real target, so
+                                    // this sentinel can never accidentally match.
+                                    let slot = token_slot(&mut expected_buf, count);
+                                    slot.push('\u{0}');
+                                    slot.push_str(token);
                                     count += 1;
+                                } else {
+                                    for (target, _) in targets {
+                                        token_slot(&mut expected_buf, count).push_str(target);
+                                        count += 1;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            match current.expected(token) {
+                                Some(target) => {
+                                    token_slot(&mut expected_buf, count).push_str(target)
+                                }
+                                None => {
+                                    accum.unmapped += 1;
+                                    let slot = token_slot(&mut expected_buf, count);
+                                    slot.push('\u{0}');
+                                    slot.push_str(token);
                                 }
                             }
-                            continue;
-                        }
+                            count += 1;
 
-                        match mapping.expected(token) {
-                            Some(target) => token_slot(&mut expected_buf, count).push_str(target),
-                            None => {
-                                accum.unmapped += 1;
-                                let slot = token_slot(&mut expected_buf, count);
-                                slot.push('\u{0}');
-                                slot.push_str(token);
+                            if current.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled()
+                            {
+                                accum.ambiguous_samples.offer_with(token, || Example {
+                                    id: id.clone(),
+                                    row: row_number,
+                                    left: token.clone(),
+                                    right: right_buf.clone(),
+                                    expected: current.expected(token).map(str::to_string),
+                                });
                             }
                         }
-                        count += 1;
-
-                        if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
-                            accum.ambiguous_samples.offer_with(token, || Example {
-                                id: id.clone(),
-                                row: row_number,
-                                left: token.clone(),
-                                right: right_buf.clone(),
-                                expected: mapping.expected(token).map(str::to_string),
-                            });
-                        }
+                        expected_buf.truncate(count);
+                        expected_buf.sort_unstable();
+                        expected_buf.dedup();
+                        expected = &expected_buf;
+                        multi_target = current.multi_target;
+                    } else {
+                        // No mapping: the transformed left value *is* the
+                        // expected set, so sort it in place instead of cloning.
+                        left_tokens.sort_unstable();
+                        left_tokens.dedup();
+                        expected = &left_tokens;
                     }
-                    expected_buf.truncate(count);
-                    expected_buf.sort_unstable();
-                    expected_buf.dedup();
-                    expected = &expected_buf;
-                    multi_target = mapping.multi_target;
-                } else {
-                    // No mapping: the transformed left value *is* the
-                    // expected set, so sort it in place instead of cloning.
-                    left_tokens.sort_unstable();
-                    left_tokens.dedup();
-                    expected = &left_tokens;
                 }
 
                 right_tokens.sort_unstable();
@@ -968,7 +1109,14 @@ fn validate_segment(
                             &id,
                         );
                     }
-                    if want_hit {
+                    if want_hit
+                        && accum.wants_condition(
+                            RowOutcome::Passed,
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                        )
+                    {
                         accum.push_hit(RowHit {
                             id: id.clone(),
                             row: row_number,
@@ -994,7 +1142,14 @@ fn validate_segment(
                             &id,
                         );
                     }
-                    if want_hit {
+                    if want_hit
+                        && accum.wants_condition(
+                            RowOutcome::Failed,
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                        )
+                    {
                         accum.push_hit(RowHit {
                             id: id.clone(),
                             row: row_number,
@@ -1044,6 +1199,122 @@ fn find_target_match<'a>(
         }
     }
     None
+}
+
+/// Resolve a file-mapped rule against its ordered sources for one row.
+///
+/// Each source keys the row on its own input columns; sources are consulted in
+/// order and [`FallbackMode`] decides when to move on. The deciding source's
+/// key is left in `left_buf`/`left_tokens`, its targets in `expected_buf`, and
+/// the mapping it used is returned for the comparison. Also returns whether
+/// every source key composed cleanly and whether the row was unmapped.
+#[allow(clippy::too_many_arguments)]
+fn resolve_file_sources<'a>(
+    sources: &[MappingSourcePlan],
+    mappings: &'a [Arc<Mapping>],
+    rule: &CompiledRule,
+    cells: &[String],
+    slots: &Slots,
+    derived: &[String],
+    right_buf: &str,
+    id: &str,
+    row_number: Option<u64>,
+    component_buf: &mut String,
+    component_buf2: &mut String,
+    left_buf: &mut String,
+    left_tokens: &mut Vec<String>,
+    expected_buf: &mut Vec<String>,
+    accum: &mut RuleAccum,
+) -> (bool, Option<&'a Mapping>, bool, bool) {
+    let mut key_ok = true;
+    let last = sources.len().saturating_sub(1);
+    let mut deciding: Option<&Mapping> = None;
+
+    for (index, source) in sources.iter().enumerate() {
+        key_ok &= compose_side(
+            &source.key,
+            cells,
+            slots,
+            derived,
+            &rule.transform_left,
+            &rule.join_separator,
+            rule.trim,
+            component_buf,
+            component_buf2,
+            left_buf,
+        );
+        fill_tokens(left_buf, rule.multi, &rule.separator, left_tokens);
+
+        let mapping = &mappings[index];
+        let all_unmapped = left_tokens.iter().all(|token| {
+            if mapping.multi_target {
+                mapping.targets_for(token).is_empty()
+            } else {
+                mapping.expected(token).is_none()
+            }
+        });
+        let any_ambiguous = left_tokens.iter().any(|token| mapping.is_ambiguous(token));
+        let more = index < last;
+        let consult_next = match source.when {
+            FallbackMode::Unmapped => all_unmapped && more,
+            FallbackMode::Ambiguous => (all_unmapped || any_ambiguous) && more,
+            FallbackMode::Always => more,
+        };
+        if consult_next {
+            continue;
+        }
+        deciding = Some(mapping);
+        break;
+    }
+
+    let mapping = deciding.expect("at least one source decides the lookup");
+    let mut had_unmapped = false;
+    let mut count = 0usize;
+    for token in left_tokens.iter() {
+        if mapping.multi_target {
+            let targets = mapping.targets_for(token);
+            if targets.is_empty() {
+                accum.unmapped += 1;
+                had_unmapped = true;
+                let slot = token_slot(expected_buf, count);
+                slot.push('\u{0}');
+                slot.push_str(token);
+                count += 1;
+            } else {
+                for (target, _) in targets {
+                    token_slot(expected_buf, count).push_str(target);
+                    count += 1;
+                }
+            }
+            continue;
+        }
+
+        match mapping.expected(token) {
+            Some(target) => token_slot(expected_buf, count).push_str(target),
+            None => {
+                accum.unmapped += 1;
+                had_unmapped = true;
+                let slot = token_slot(expected_buf, count);
+                slot.push('\u{0}');
+                slot.push_str(token);
+            }
+        }
+        count += 1;
+
+        if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
+            accum.ambiguous_samples.offer_with(token, || Example {
+                id: id.to_string(),
+                row: row_number,
+                left: token.clone(),
+                right: right_buf.to_string(),
+                expected: mapping.expected(token).map(str::to_string),
+            });
+        }
+    }
+    expected_buf.truncate(count);
+    expected_buf.sort_unstable();
+    expected_buf.dedup();
+    (key_ok, Some(mapping), mapping.multi_target, had_unmapped)
 }
 
 /// The id used to identify a row in the report: the trimmed id column, or a
@@ -1119,47 +1390,39 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
     // Resolve file-based mappings up-front, reusing parsed reference tables
     // and equivalent mappings across rules.
     let mut cache = mapping::MappingCache::new();
-    let mut mappings: Vec<Option<Arc<Mapping>>> = Vec::with_capacity(plan.rules.len());
+    let mut mappings: Vec<Vec<Arc<Mapping>>> = Vec::with_capacity(plan.rules.len());
     for rule in &plan.rules {
-        let mapping = match &rule.mapping {
-            MappingPlan::Files {
-                files,
-                left,
-                right,
-                multi,
-                separator,
-                filter,
-            } => {
-                // When the rule's `right` is a list of columns, the reference
-                // `mapping_right` columns are a composite value to match; a
-                // single `right` column makes several `mapping_right` columns
-                // alternative acceptable targets instead.
-                let right_composite = matches!(
-                    &rule.right,
-                    crate::rules::ColumnRef::Columns(values) if values.len() > 1
-                );
-                cache
-                    .load(
-                        files,
-                        &mapping::FileMappingSpec {
-                            left_columns: left,
-                            right_columns: right,
-                            left_transforms: &rule.transform_left,
-                            right_transforms: &rule.transform_right,
-                            multi: *multi,
-                            value_separator: separator,
-                            join_separator: &rule.join_separator,
-                            trim: rule.trim,
-                            delimiter: config.delimiter,
-                            right_composite,
-                            filter: filter.as_ref(),
-                        },
-                    )
-                    .map(Some)?
+        let mut rule_mappings: Vec<Arc<Mapping>> = Vec::new();
+        if let MappingPlan::Files(sources) = &rule.mapping {
+            // When the rule's `right` is a list of columns, the reference
+            // `mapping_right` columns are a composite value to match; a
+            // single `right` column makes several `mapping_right` columns
+            // alternative acceptable targets instead.
+            let right_composite = matches!(
+                &rule.right,
+                crate::rules::ColumnRef::Columns(values) if values.len() > 1
+            );
+            for source in sources {
+                let mapping = cache.load(
+                    &source.files,
+                    &mapping::FileMappingSpec {
+                        left_columns: &source.left,
+                        right_columns: &source.right,
+                        left_transforms: &rule.transform_left,
+                        right_transforms: &rule.transform_right,
+                        multi: source.multi,
+                        value_separator: &source.separator,
+                        join_separator: &rule.join_separator,
+                        trim: rule.trim,
+                        delimiter: config.delimiter,
+                        right_composite,
+                        filter: source.filter.as_ref(),
+                    },
+                )?;
+                rule_mappings.push(mapping);
             }
-            _ => None,
-        };
-        mappings.push(mapping);
+        }
+        mappings.push(rule_mappings);
     }
 
     let auto_indices: Vec<usize> = plan
@@ -1243,9 +1506,9 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
             }
         }
         for (position, &rule_index) in auto_indices.iter().enumerate() {
-            mappings[rule_index] = Some(Arc::new(Mapping::from_counts_auto(std::mem::take(
+            mappings[rule_index] = vec![Arc::new(Mapping::from_counts_auto(std::mem::take(
                 &mut totals[position],
-            ))));
+            )))];
         }
     }
 
@@ -1266,6 +1529,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
                     row_base,
                     config.collect_hits,
                     config.collect_hits_limit,
+                    config.collect_distinct,
                     progress,
                 )
             })
@@ -1275,7 +1539,13 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
     let mut accums: Vec<RuleAccum> = plan
         .rules
         .iter()
-        .map(|rule| RuleAccum::new(rule.report_limit, config.collect_hits_limit))
+        .map(|rule| {
+            RuleAccum::new(
+                rule.report_limit,
+                config.collect_hits_limit,
+                config.collect_distinct,
+            )
+        })
         .collect();
     for segment in per_segment {
         for (index, accum) in segment.into_iter().enumerate() {
@@ -1293,7 +1563,7 @@ pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
 fn build_report(
     plan: &Plan,
     mut accums: Vec<RuleAccum>,
-    mappings: Vec<Option<Arc<Mapping>>>,
+    mappings: Vec<Vec<Arc<Mapping>>>,
 ) -> Report {
     let mut rules = Vec::with_capacity(plan.rules.len());
     let mut rows_checked = 0u64;
@@ -1303,7 +1573,7 @@ fn build_report(
         let accum = &accums[index];
         rows_checked = rows_checked.max(accum.checked);
 
-        let mapping_report = mappings[index].as_ref().map(|mapping| {
+        let mapping_report = mappings[index].first().map(|mapping| {
             build_mapping_report(mapping, &accum.ambiguous_samples, rule.report_limit)
         });
 

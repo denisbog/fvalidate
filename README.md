@@ -152,6 +152,7 @@ several lines as long as brackets/quotes balance.
 | `mapping_files` | List of reference CSVs; enables file-based mapping. |
 | `mapping_left`, `mapping_right` | Column(s) inside the reference files. `mapping_left` lists form a composite key; several `mapping_right` columns list acceptable targets (the row matches if its right side equals any of them). |
 | `mapping_multi`, `mapping_separator` | Multi-value handling inside reference files. |
+| `mapping { ... }` | An ordered reference source. Repeatable; each block takes `files`, `left` (reference key columns), `right` (reference target columns), optional `key` (data-side key: a column, `[a, b]` or `or(...)`; defaults to `left`), `multi`, `separator`, `filter` and `when` (`unmapped`, `ambiguous`, `always`). See [Fallback mapping sources](#fallback-mapping-sources). |
 | `report_limit` | Overrides `-n` for this rule. |
 
 Defaults can be set for `separator`, `multi`, `compare`, `report_limit`,
@@ -244,6 +245,55 @@ A single `mapping_right` column keeps the plain behaviour: the canonical
 With several `mapping_right` columns the targets are alternatives, so the key
 is not reported as ambiguous.
 
+### Fallback mapping sources
+
+`mapping_files` unions every file under the *same* `mapping_left`/`mapping_right`
+columns, and a value found in an earlier file is never looked up in a later one.
+When the fallback needs **different input columns** — say `city` first, then
+`city + area` from another file — use one `mapping { ... }` block per source.
+Blocks are tried in order and the first source that resolves the row decides it.
+
+```text
+rule "city maps to code, falling back to city + area" {
+  right = city_code
+
+  mapping {
+    files = ["examples/citymap1.csv"]         # city -> code
+    left  = city
+    right = code
+  }
+
+  mapping {
+    files = ["examples/citymap2-by-area.csv"] # city + area -> code
+    left  = [city, area]
+    right = code
+    when  = unmapped                          # default
+  }
+}
+```
+
+* `left`/`right` name the **reference** columns; `key` names the **data** columns
+  and defaults to `left` (same names). `key` accepts a column, a composite
+  `[city, area]` or a fallback `or(city, region)`.
+* `when` controls the hand-off: `unmapped` (default — move on only when this
+  source has no entry for the key), `ambiguous` (also move on when this source
+  disagrees with itself), or `always` (the next source overrides, so later blocks
+  take precedence).
+* `filter`, `multi` and `separator` can be set per block; they override the
+  rule-level value for that source. A rule-level `mapping_filter` still applies
+  to every source that does not define its own.
+
+Run the bundled example:
+
+```bash
+fvalidate examples/cities_fallback.csv -r examples/rules_mapping_fallback.vl --id-column id
+```
+
+Row 2 (`Berlin`) is absent from `citymap1.csv`, so it falls through to the
+`city + area` file; row 5 (`Paris`) *is* in `citymap1.csv`, so the disagreement
+is reported instead of being silently overridden. The report's mapping section
+describes the first source; the per-row lookup consults the rest.
+
 ### Transforms
 
 Applied left-to-right, zero allocation after warm-up:
@@ -331,6 +381,9 @@ A mapping is the relation `left value → target value(s)`.
   accepted; unmatched left values fail and are counted as `unmapped_values`.
   A `mapping_filter` restricts which reference rows are loaded (see
   [Row predicates](#row-predicates)).
+* **`mapping { ... }` blocks** declare several ordered sources that may key on
+  **different input columns**, so a value missing from one reference file can be
+  resolved from another (see [Fallback mapping sources](#fallback-mapping-sources)).
 
 Reference files are parsed **once** and cached for the whole run. Rules that
 ask for the same files with the same columns, transforms and filter share a
@@ -520,6 +573,12 @@ docks a vertical rule panel on the left:
   **failed**, **skipped** or **validation skipped** count shows only that
   outcome; the active count turns into a **clear** action, and searching returns
   the grid to the normal scan.
+* The **distinct** checkbox samples the collected rule rows by their comparison
+  condition instead of keeping the first ones: each distinct
+  `(left, right, expected)` contributes at most a tenth of the **rows** budget,
+  and the grid groups the rows under a heading naming the wrong value
+  (`expected “X” · saw “Y”`) — useful for seeing *which* failures exist rather
+  than thousands of rows that all failed the same way.
 * The **rule attributes only** checkbox hides every column the active rule does
   not read from the main grid (and from the row detail form), so a wide file
   collapses to just the attributes that matter; turning it off restores the
@@ -615,6 +674,9 @@ examples/
   loose.csv    fallback / skip / mapping_filter fixture
   loose_map.csv
   rules_filters.vl     or(...) + validation_skipped + mapping_filter example
+  citymap2-by-area.csv  city + area -> code reference
+  cities_fallback.csv   ordered mapping-block fixture
+  rules_mapping_fallback.vl  fallback mapping example
   weather_cities.csv   city -> country reference used by `rules_weather.vl`
   rules_weather.vl     temperature-record rules (date, conversion, mapping)
 ```

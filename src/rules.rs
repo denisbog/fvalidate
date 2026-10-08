@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use regex::Regex;
 
 use crate::compare::CompareOp;
-use crate::dsl::{ColumnSpec, MappingSourceDef, Predicate, Program};
+use crate::dsl::{ColumnSpec, FallbackMode, MappingSourceDef, Predicate, Program};
 use crate::expr::{BinOp, Expr, ValueRef};
 use crate::pattern::Separator;
 use crate::transform::Transform;
@@ -39,17 +39,27 @@ pub enum MappingPlan {
     None,
     /// Extract the mapping from the data itself.
     Auto,
-    /// Load from reference files.
-    Files {
-        files: Vec<PathBuf>,
-        left: Vec<String>,
-        right: Vec<String>,
-        multi: bool,
-        separator: Separator,
-        /// Optional predicate over reference rows; only matching rows define
-        /// the mapping. Columns are resolved against each file's header.
-        filter: Option<Predicate>,
-    },
+    /// One or more ordered reference sources, resolved left to right.
+    Files(Vec<MappingSourcePlan>),
+}
+
+/// One compiled `mapping { ... }` source.
+#[derive(Debug, Clone)]
+pub struct MappingSourcePlan {
+    pub files: Vec<PathBuf>,
+    /// Reference-file column(s) forming the lookup key.
+    pub left: Vec<String>,
+    /// Reference-file column(s) forming the target value.
+    pub right: Vec<String>,
+    /// Data-row value(s) forming the lookup key.
+    pub key: ColumnRef,
+    pub multi: bool,
+    pub separator: Separator,
+    /// Optional predicate over reference rows; only matching rows define the
+    /// mapping. Columns are resolved against each file's header.
+    pub filter: Option<Predicate>,
+    /// When to consult the next source instead of this one.
+    pub when: FallbackMode,
 }
 
 /// A resolved side of a rule: one or more value references (an input column or
@@ -245,6 +255,11 @@ impl CompiledRule {
         let mut out = Vec::new();
         self.left.collect_columns(&mut out);
         self.right.collect_columns(&mut out);
+        if let MappingPlan::Files(sources) = &self.mapping {
+            for source in sources {
+                source.key.collect_columns(&mut out);
+            }
+        }
         if let Some(predicate) = &self.skip {
             predicate.collect_indices(&mut out);
         }
@@ -572,24 +587,31 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
         let mapping = match &def.mapping {
             MappingSourceDef::None => MappingPlan::None,
             MappingSourceDef::Auto => MappingPlan::Auto,
-            MappingSourceDef::Files {
-                files,
-                left,
-                right,
-                multi,
-                separator,
-            } => MappingPlan::Files {
-                files: files.clone(),
-                left: left.clone(),
-                right: right.clone(),
-                multi: *multi,
-                separator: separator
-                    .clone()
-                    .unwrap_or_else(|| program.defaults.mapping_separator.clone()),
-                // The reference filter is compiled later, against each file's
-                // own header row.
-                filter: def.mapping_filter.clone(),
-            },
+            MappingSourceDef::Files(sources) => MappingPlan::Files(
+                sources
+                    .iter()
+                    .map(|source| {
+                        let key_spec = source.key.clone().unwrap_or_else(|| def.left.clone());
+                        let key =
+                            compile_columns(&context, "mapping key", &key_spec, headers, &derived_names)?;
+                        Ok(MappingSourcePlan {
+                            files: source.files.clone(),
+                            left: source.left.clone(),
+                            right: source.right.clone(),
+                            key,
+                            multi: source.multi,
+                            separator: source
+                                .separator
+                                .clone()
+                                .unwrap_or_else(|| program.defaults.mapping_separator.clone()),
+                            // The reference filter is compiled later, against
+                            // each file's own header row.
+                            filter: source.filter.clone().or_else(|| def.mapping_filter.clone()),
+                            when: source.when,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            ),
         };
 
         // `mapping_filter` filters the rows that define a mapping. For `auto`
@@ -609,10 +631,19 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
                 }
                 None
             }
-            MappingSourceDef::Files { .. } => None,
+            MappingSourceDef::Files(_) => None,
         };
 
-        let left_name = def.left.display();
+        let left_name = if !def.left.is_empty() {
+            def.left.display()
+        } else if let MappingSourceDef::Files(sources) = &def.mapping {
+            sources
+                .first()
+                .map(|source| source.key.as_ref().map(ColumnSpec::display).unwrap_or_default())
+                .unwrap_or_default()
+        } else {
+            def.left.display()
+        };
         let right_name = if def.right.is_empty() {
             "(pattern)".to_string()
         } else {

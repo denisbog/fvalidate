@@ -96,6 +96,8 @@ const DEBOUNCE_TICK_MS: u64 = 50;
 const DEBOUNCE_QUIET_MS: u64 = 180;
 /// Fixed height of one table row in the table view.
 const TABLE_ROW_HEIGHT: f32 = 24.0;
+/// Height of a distinct-condition group heading in the grid.
+const GROUP_HEADING_HEIGHT: f32 = 26.0;
 /// Minimum width of a table column. The table grows horizontally instead of
 /// squeezing columns below this.
 const TABLE_CELL_MIN_WIDTH: f32 = 160.0;
@@ -127,6 +129,12 @@ const MAIN_GAP: f32 = 8.0;
 /// Right padding of the row list. It keeps chips clear of the scrollbar iced
 /// draws over the scrollable's right edge.
 const LIST_RIGHT_PADDING: f32 = 14.0;
+/// Inner padding of the grid card. It keeps the opaque striped rows off the
+/// rounded border, so the card's corner radius stays visible instead of being
+/// covered by a square stripe. Must clear the border's inner arc, i.e. at least
+/// `CARD_RADIUS - (CARD_RADIUS - 1) / √2` (~3.64 for radius 10), so a row
+/// corner sits inside the rounded corner rather than over it.
+const GRID_PADDING: f32 = 5.0;
 /// Spacing between the chip lines inside a stripe.
 const CHIP_LINE_SPACING: f32 = 6.0;
 /// Rows rendered above and below the viewport so scrolling does not flash gaps.
@@ -229,6 +237,11 @@ struct RulesState {
     /// Which side of `hits` the grid shows: `None` = every row, otherwise only
     /// rows with that outcome (passed, failed, skipped, validation-skipped).
     hits_filter: Option<RowOutcome>,
+    /// When true, a collected rule's rows are sampled per distinct
+    /// `(left, right, expected)` condition instead of filling the budget with
+    /// rows that all failed the same way. The grid then groups rows by
+    /// condition.
+    distinct: bool,
     /// Whether the main grid currently shows rule rows (rather than scan
     /// results).
     view_active: bool,
@@ -272,6 +285,8 @@ struct RuleHits {
     /// Per-outcome cap used when collecting. A larger display limit needs a
     /// fresh collection.
     cap: usize,
+    /// Whether the rows were collected per distinct condition.
+    distinct: bool,
     hits: Vec<RowHit>,
     /// Shared with the grid: switching outcome clones the `Arc`s, not the rows.
     rows: Vec<Arc<Vec<String>>>,
@@ -406,6 +421,21 @@ fn hidden_note(count: usize) -> String {
 /// Status line for the current scan. `rows_read` is the number of data rows
 /// read; when the scan was not truncated it is the total number of rows in the
 /// file. `elapsed` appends how long the search itself took.
+/// The `(left, right, expected)` condition a hit was grouped under in the
+/// distinct-row mode.
+fn condition_key(hit: &RowHit) -> (String, String, Option<String>) {
+    (hit.left.clone(), hit.right.clone(), hit.expected.clone())
+}
+
+/// Heading shown above one distinct-condition group, naming the wrong value the
+/// rows share.
+fn condition_heading(hit: &RowHit) -> String {
+    match &hit.expected {
+        Some(expected) => format!("expected “{expected}” · saw “{}”", hit.right),
+        None => format!("“{}” vs “{}”", hit.left, hit.right),
+    }
+}
+
 fn status_text(
     shown: usize,
     matched: usize,
@@ -619,6 +649,8 @@ enum Message {
     ClearRuleView,
     /// Show only the attributes referenced by the row's rule.
     ToggleRuleAttrsOnly(bool),
+    /// Sample a rule's collected rows per distinct failing condition.
+    ToggleDistinct(bool),
     /// `(column, path, result)`; a background column-index build finished. The
     /// path is carried so a build that outlives a file switch is discarded.
     IndexBuilt(usize, PathBuf, Result<ColumnIndex, String>),
@@ -645,6 +677,10 @@ struct Viewer {
     /// The rows currently shown. Rows are shared (`Arc`) so a rule-view filter
     /// switch re-uses the cached records instead of deep-copying them.
     rows: Vec<Arc<Vec<String>>>,
+    /// Per-row group heading, aligned with `rows`. `Some` when the row starts a
+    /// new distinct-condition group (rule view, distinct mode); the grid renders
+    /// the heading above that row.
+    row_groups: Vec<Option<String>>,
     /// The row opened in the floating detail form.
     detail: Option<DetailState>,
     /// Attribute whose value was last copied from the detail form, so the form
@@ -735,6 +771,7 @@ impl Viewer {
             show_hidden: false,
             filter: String::new(),
             rows: Vec::new(),
+            row_groups: Vec::new(),
             detail: None,
             copy_notice: None,
             show_rules: false,
@@ -806,6 +843,7 @@ impl Viewer {
         self.scan_duration = None;
         self.dirty = false;
         self.rows.clear();
+        self.row_groups.clear();
         self.detail = None;
         self.copy_notice = None;
         // The evaluated report belonged to the previous file; drop it (but keep
@@ -1038,7 +1076,7 @@ impl Viewer {
                 let mut program = dsl::load_file(&rules_path)?;
                 program.defaults.report_limit = 50;
                 let plan = rules::compile(program, &headers)?;
-                let report = run_plan(&plan, &csv, delimiter, None, usize::MAX)?;
+                let report = run_plan(&plan, &csv, delimiter, None, usize::MAX, false)?;
                 Ok(EvaluatedRules {
                     plan: Arc::new(plan),
                     report,
@@ -1075,8 +1113,15 @@ impl Viewer {
         }
         // Showing rule rows takes over the grid, so abandon any running scan.
         self.cancel_scan();
-        // Data already collected: just switch side / re-activate.
-        if self.rules.hits.as_ref().map(|hits| hits.rule) == Some(rule) {
+        // Data already collected for this rule in the current mode: just switch
+        // side / re-activate. A changed distinct mode invalidates the sample,
+        // so it falls through to a fresh collection.
+        let fresh = self
+            .rules
+            .hits
+            .as_ref()
+            .is_some_and(|hits| hits.rule == rule && hits.distinct == self.rules.distinct);
+        if fresh {
             self.abort_rule_collection();
             self.rules.hits_filter = filter;
             self.rules.view_active = true;
@@ -1112,8 +1157,9 @@ impl Viewer {
         let generation = self.rules.generation;
         let delimiter = self.delimiter;
         let limit = self.limit;
+        let distinct = self.rules.distinct;
         Task::perform(
-            async move { collect_rule_hits(plan, rule, csv, delimiter, limit) },
+            async move { collect_rule_hits(plan, rule, csv, delimiter, limit, distinct) },
             move |result| Message::RuleRowsCollected(generation, rule, result),
         )
     }
@@ -1177,31 +1223,59 @@ impl Viewer {
     /// Fill the main grid with the currently selected side of the collected
     /// rule rows.
     fn apply_rule_view(&mut self) -> Task<Message> {
-        let (mut rows, matching, total) = {
+        let (mut rows, mut groups, matching, total) = {
             let Some(hits) = &self.rules.hits else {
                 return Task::none();
             };
             let filter = self.rules.hits_filter;
-            let mut rows = Vec::new();
-            for (hit, row) in hits.hits.iter().zip(hits.rows.iter()) {
-                let keep = match filter {
-                    None => true,
-                    Some(outcome) => hit.outcome == outcome,
-                };
-                if keep {
-                    // Share the collected record; only the pointer is cloned.
-                    rows.push(Arc::clone(row));
+            // Indices of the hits to show, in file order.
+            let mut selected: Vec<usize> = hits
+                .hits
+                .iter()
+                .enumerate()
+                .filter(|(_, hit)| filter.is_none() || filter == Some(hit.outcome))
+                .map(|(index, _)| index)
+                .collect();
+            let mut groups: Vec<Option<String>> = Vec::with_capacity(selected.len());
+            if hits.distinct {
+                // Distinct mode groups equal conditions together and labels the
+                // first row of each group, so it is clear which wrong value a
+                // block of rows belongs to.
+                selected.sort_by(|&a, &b| {
+                    condition_key(&hits.hits[a]).cmp(&condition_key(&hits.hits[b]))
+                });
+                let mut last: Option<(String, String, Option<String>)> = None;
+                for &index in &selected {
+                    let hit = &hits.hits[index];
+                    let key = condition_key(hit);
+                    if last.as_ref() != Some(&key) {
+                        groups.push(Some(condition_heading(hit)));
+                        last = Some(key);
+                    } else {
+                        groups.push(None);
+                    }
                 }
+            } else {
+                groups.resize(selected.len(), None);
             }
-            // The retained list is capped, so the exact totals come from the
-            // full evaluation rather than from the collected rows.
-            (rows, hits.total_for(filter) as usize, hits.total_for(None) as usize)
+            let rows: Vec<Arc<Vec<String>>> = selected
+                .iter()
+                .map(|&index| Arc::clone(&hits.rows[index]))
+                .collect();
+            (
+                rows,
+                groups,
+                hits.total_for(filter) as usize,
+                hits.total_for(None) as usize,
+            )
         };
         // Honor the "rows" drop-down even in the rule view: the filter stays in
         // force, only the number of displayed rows changes. `matched` keeps the
         // full count so the status line can say how many were truncated.
         rows.truncate(self.limit);
+        groups.truncate(self.limit);
         self.rows = rows;
+        self.row_groups = groups;
         self.matched = matching;
         self.truncated = matching > self.rows.len();
         self.rows_read = total;
@@ -1559,6 +1633,18 @@ impl Viewer {
                 self.sync_rule_attrs();
                 Task::none()
             }
+            Message::ToggleDistinct(checked) => {
+                self.rules.distinct = checked;
+                // A fresh sample is needed; the collected rows were capped by
+                // the previous mode.
+                if let Some(rule) = self.active_rule() {
+                    let filter = self.rules.hits_filter;
+                    discard_rule_hits(self.rules.hits.take());
+                    self.rules.view_active = false;
+                    return self.show_rule_rows(rule, filter);
+                }
+                Task::none()
+            }
             Message::Resized(width, height) => {
                 // Keep the virtual viewport fresh so a taller window renders more
                 // rows without waiting for the next scroll event.
@@ -1580,6 +1666,7 @@ impl Viewer {
                 match result {
                     Ok(scan) => {
                         self.rows = scan.rows.into_iter().map(Arc::new).collect();
+                        self.row_groups.clear();
                         self.matched = scan.matched;
                         self.truncated = scan.truncated;
                         self.rows_read = scan.rows_read;
@@ -1930,13 +2017,17 @@ impl Viewer {
             limit_choices.push(self.limit);
             limit_choices.sort_unstable();
         }
-        let options = row![
+        let view_options = row![
             checkbox("visible only", self.visible_only)
                 .on_toggle(Message::ToggleVisibleOnly)
                 .text_size(12)
                 .style(checkbox_style),
             checkbox("parallel", self.parallel)
                 .on_toggle(Message::ToggleParallel)
+                .text_size(12)
+                .style(checkbox_style),
+            checkbox("distinct", self.rules.distinct)
+                .on_toggle(Message::ToggleDistinct)
                 .text_size(12)
                 .style(checkbox_style),
             checkbox("table", self.table)
@@ -1951,14 +2042,20 @@ impl Viewer {
                 .on_toggle(Message::ToggleAttributeNames)
                 .text_size(12)
                 .style(checkbox_style),
-            Space::with_width(16),
-            text("rows").size(12).color(muted_text(&theme)),
+        ]
+        .spacing(12)
+        .align_y(Center)
+        .wrap();
+
+        let rows_options = row![
+            text("show").size(12).color(muted_text(&theme)),
             pick_list(limit_choices, Some(self.limit), Message::LimitSelected)
                 .padding(4)
                 .text_size(12)
                 .style(pick_list_style),
+            text("matching rows").size(12).color(muted_text(&theme)),
         ]
-        .spacing(12)
+        .spacing(8)
         .align_y(Center)
         .wrap();
 
@@ -2025,16 +2122,21 @@ impl Viewer {
         }
         // Width a chip line may use, and how many hidden-attribute chips fit on
         // one line in the controls bar.
-        let available = chip_area_width(grid_width);
+        let available = chip_area_width(grid_width - 2.0 * GRID_PADDING);
         // Hidden-attribute chips flow in a wrapping row inside the
         // configuration panel, so they pack the panel width instead of one
         // chip per line.
 
-        // Each group gets a heading so the panel reads as sections: the
-        // view/scan options, then the attributes, then the profiles.
+        // The controls are grouped under four headings — View, Rows, Attributes
+        // and Profile — separated by hairlines so each section reads on its own.
         let mut hidden_bar = column![
             text("View").size(13).color(muted_text(&theme)),
-            options,
+            view_options,
+            horizontal_rule(1).style(divider_style),
+            text("Rows").size(13).color(muted_text(&theme)),
+            rows_options,
+            horizontal_rule(1).style(divider_style),
+            text("Attributes").size(13).color(muted_text(&theme)),
         ]
         .spacing(8)
         .padding(0);
@@ -2082,10 +2184,12 @@ impl Viewer {
                     .style(ghost_button),
             );
         }
+        // The hide/unhide actions form one row under the "Attributes" heading;
+        // the filter and the hidden-attribute list follow below it.
+        hidden_bar = hidden_bar.push(controls.wrap());
         // Attribute filter: highlights matching chips in the main view and
         // narrows the hidden attribute list below to the matching names.
-        controls = controls.push(text("Attributes").size(13).color(muted_text(&theme)));
-        controls = controls.push(
+        hidden_bar = hidden_bar.push(
             text_input("filter attributes…", &self.attribute_filter)
                 .on_input(Message::AttributeFilterChanged)
                 .padding(8)
@@ -2093,7 +2197,6 @@ impl Viewer {
                 .style(input_style)
                 .width(Length::Fill),
         );
-        hidden_bar = hidden_bar.push(controls.wrap());
         // The hidden attribute names are sorted alphabetically so a large
         // attribute list stays easy to scan. The list is collapsed by default
         // (a long list would otherwise push the rows off screen); it opens when
@@ -2171,7 +2274,6 @@ impl Viewer {
         // overwrite it, or save the current visible set under a new name.
         let profile_names: Vec<String> = self.profiles.keys().cloned().collect();
         let mut profile_controls = Row::new().spacing(10).align_y(Center).width(Fill);
-        profile_controls = profile_controls.push(text("Profile").size(13).color(muted_text(&theme)));
         profile_controls = profile_controls.push(
             pick_list(
                 profile_names,
@@ -2209,6 +2311,8 @@ impl Viewer {
         if let Some(status) = &self.index_status {
             profile_controls = profile_controls.push(text(status.as_str()).size(12));
         }
+        hidden_bar = hidden_bar.push(horizontal_rule(1).style(divider_style));
+        hidden_bar = hidden_bar.push(text("Profile").size(13).color(muted_text(&theme)));
         hidden_bar = hidden_bar.push(profile_controls.wrap());
 
         // Prompt for the name of a new profile.
@@ -2319,7 +2423,7 @@ impl Viewer {
             let total_rows = self.rows.len();
             let viewport = self.viewport_height.max(1.0);
 
-            let row_heights: Vec<f32> = if show_table {
+            let mut row_heights: Vec<f32> = if show_table {
                 vec![TABLE_ROW_HEIGHT; total_rows]
             } else {
                 let show_names = self.show_attr_names;
@@ -2340,6 +2444,12 @@ impl Viewer {
                     })
                     .collect()
             };
+            // Distinct groups reserve extra vertical space for their heading.
+            for (index, height) in row_heights.iter_mut().enumerate() {
+                if self.row_groups.get(index).is_some_and(|group| group.is_some()) {
+                    *height += GROUP_HEADING_HEIGHT;
+                }
+            }
             let mut row_tops = Vec::with_capacity(total_rows + 1);
             row_tops.push(0.0f32);
             for height in &row_heights {
@@ -2437,6 +2547,31 @@ impl Viewer {
             for (offset, values) in self.rows[first..last].iter().enumerate() {
                 let index = first + offset;
                 let row_height = row_heights[index];
+                let heading = self.row_groups.get(index).and_then(Option::as_ref);
+                let data_height = row_height
+                    - if heading.is_some() {
+                        GROUP_HEADING_HEIGHT
+                    } else {
+                        0.0
+                    };
+                let mut stripe = column![].spacing(0);
+                if let Some(heading) = heading {
+                    stripe = stripe.push(
+                        container(
+                            text(heading.clone())
+                                .size(12)
+                                .color(muted_text(&theme)),
+                        )
+                        .width(if show_table {
+                            Length::Fixed(table_width)
+                        } else {
+                            Length::Fill
+                        })
+                        .height(Length::Fixed(GROUP_HEADING_HEIGHT))
+                        .padding([4, 10])
+                        .style(stripe_style(true)),
+                    );
+                }
                 if show_table {
                     let mut line = Row::new().spacing(0);
                     for (column_position, &column) in visible_columns.iter().enumerate() {
@@ -2449,19 +2584,20 @@ impl Viewer {
                         );
                     }
                     let striped = index % 2 == 1;
-                    list = list.push(
+                    stripe = stripe.push(
                         button(
                             container(line)
                                 .width(Length::Fixed(table_width))
-                                .height(Length::Fixed(row_height))
+                                .height(Length::Fixed(data_height))
                                 .clip(true),
                         )
                         .on_press(Message::RowClicked(index))
                         .padding(0)
                         .width(Length::Fixed(table_width))
-                        .height(Length::Fixed(row_height))
+                        .height(Length::Fixed(data_height))
                         .style(move |theme, status| row_button_style(theme, status, striped, true)),
                     );
+                    list = list.push(stripe);
                     continue;
                 }
                 // Greedily pack the chips for this row: a chip that does not fit
@@ -2479,7 +2615,7 @@ impl Viewer {
                         )
                     })
                     .collect();
-                let mut block = column![].spacing(CHIP_LINE_SPACING);
+                let mut chips = column![].spacing(CHIP_LINE_SPACING);
                 for range in chip_lines(&widths, available) {
                     let mut line = Row::new().spacing(CHIP_SPACING);
                     for position in range {
@@ -2502,7 +2638,7 @@ impl Viewer {
                     }
                     // Clip each chip line to a fixed height so a very long value
                     // cannot make one line taller than the rest.
-                    block = block.push(
+                    chips = chips.push(
                         container(line)
                             .height(Length::Fixed(chip_line_box()))
                             .clip(true),
@@ -2512,20 +2648,21 @@ impl Viewer {
                 // which captures its own click) opens the same attribute form as
                 // a table row.
                 let striped = index % 2 == 1;
-                list = list.push(
+                stripe = stripe.push(
                     button(
-                        container(block)
+                        container(chips)
                             .width(Fill)
-                            .height(Length::Fixed(row_height))
+                            .height(Length::Fixed(data_height))
                             .clip(true)
                             .padding([STRIPE_PADDING, STRIPE_PADDING_H]),
                     )
                     .on_press(Message::RowClicked(index))
                     .padding(0)
                     .width(Fill)
-                    .height(Length::Fixed(row_height))
+                    .height(Length::Fixed(data_height))
                     .style(move |theme, status| row_button_style(theme, status, striped, false)),
                 );
+                list = list.push(stripe);
             }
 
             if last < total_rows {
@@ -2562,6 +2699,7 @@ impl Viewer {
             .width(Fill)
             .height(Fill)
             .clip(true)
+            .padding(GRID_PADDING)
             .style(card_style),
         ]
         .spacing(8)
@@ -3266,7 +3404,18 @@ fn menu_tab<'a>(
     }
     title = title.push(text(label).size(14).color(color));
     let content = column![title, underline].spacing(5).align_x(Center);
-    let mut tab = button(content).padding([7, 14]).style(ghost_button);
+    // Center the *label* rather than the label-plus-underline block: the
+    // underline (spacing + 2px bar) hangs below the midline, so the tab would
+    // otherwise sit ~3.5px above the brand text. The extra top padding exactly
+    // cancels that, without changing the tab's overall height.
+    let mut tab = button(content)
+        .padding(Padding {
+            top: 10.5,
+            right: 14.0,
+            bottom: 3.5,
+            left: 14.0,
+        })
+        .style(ghost_button);
     if let Some(message) = on_press {
         tab = tab.on_press(message);
     }
@@ -3683,7 +3832,12 @@ fn chip_button_style(theme: &Theme, status: button::Status) -> button::Style {
             _ => None,
         },
         text_color: palette.background.base.text,
-        border: Border::default(),
+        // Match the chip container's radius so the hover/selected fill does not
+        // show square corners behind the rounded chip.
+        border: Border {
+            radius: RADIUS.into(),
+            ..Border::default()
+        },
         shadow: Shadow::default(),
     }
 }
@@ -3769,6 +3923,7 @@ fn run_plan(
     delimiter: u8,
     collect_hits: Option<usize>,
     hits_limit: usize,
+    distinct: bool,
 ) -> Result<Report, String> {
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -3783,6 +3938,7 @@ fn run_plan(
         progress: None,
         collect_hits,
         collect_hits_limit: hits_limit,
+        collect_distinct: distinct,
     };
     engine::run(plan, &config)
 }
@@ -3807,6 +3963,7 @@ fn collect_rule_hits(
     csv: PathBuf,
     delimiter: u8,
     limit: usize,
+    distinct: bool,
 ) -> Result<RuleHits, String> {
     let compiled = plan
         .rules
@@ -3816,7 +3973,7 @@ fn collect_rule_hits(
     let single = Plan {
         rules: vec![compiled],
     };
-    let mut report = run_plan(&single, &csv, delimiter, Some(0), limit)?;
+    let mut report = run_plan(&single, &csv, delimiter, Some(0), limit, distinct)?;
     let entry = report
         .rules
         .get_mut(0)
@@ -3837,6 +3994,7 @@ fn collect_rule_hits(
         failed: entry.rows_failed,
         skipped: entry.rows_skipped,
         validation_skipped: entry.rows_validation_skipped,
+        distinct,
     })
 }
 
@@ -4611,7 +4769,7 @@ mod tests {
         let headers = engine::read_headers(&path, b',').unwrap();
         let program = dsl::load_file(&rules_path).unwrap();
         let plan = Arc::new(rules::compile(program, &headers).unwrap());
-        let hits = collect_rule_hits(plan, 0, path, b',', usize::MAX).unwrap();
+        let hits = collect_rule_hits(plan, 0, path, b',', usize::MAX, false).unwrap();
         assert_eq!(hits.hits.len(), 3);
         assert_eq!(*hits.rows[0], vec!["1".to_string(), "Alice".to_string()]);
         assert_eq!(*hits.rows[2], vec!["3".to_string(), "Cara".to_string()]);
@@ -4638,16 +4796,70 @@ mod tests {
         let program = dsl::load_file(&rules_path).unwrap();
         let plan = Arc::new(rules::compile(program, &headers).unwrap());
 
-        let a = collect_rule_hits(Arc::clone(&plan), 0, path.clone(), b',', usize::MAX).unwrap();
+        let a =
+            collect_rule_hits(Arc::clone(&plan), 0, path.clone(), b',', usize::MAX, false).unwrap();
         assert_eq!(a.hits.len(), 2);
         assert_eq!(a.hits.iter().filter(|hit| hit.passed()).count(), 1);
         assert_eq!(a.passed, 1);
         assert_eq!(a.failed, 1);
 
-        let id = collect_rule_hits(plan, 1, path, b',', usize::MAX).unwrap();
+        let id = collect_rule_hits(plan, 1, path, b',', usize::MAX, false).unwrap();
         assert_eq!(id.hits.len(), 2);
         assert!(id.hits.iter().all(|hit| !hit.passed()));
         assert_eq!(id.failed, 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn distinct_collection_caps_each_condition_and_groups_the_grid() {
+        // One condition repeated 100 times plus five distinct ones. The plain
+        // collection would spend its whole budget on the repeated condition;
+        // the distinct mode keeps a tenth of the budget per condition.
+        let dir = std::env::temp_dir().join(format!("fview-distinct-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.csv");
+        let mut csv = String::from("id,a,b\n");
+        for index in 0..100 {
+            csv.push_str(&format!("{index},x,y\n"));
+        }
+        for index in 100..105 {
+            csv.push_str(&format!("{index},p{index},q{index}\n"));
+        }
+        std::fs::write(&path, csv).unwrap();
+        let rules_path = dir.join("r.vl");
+        std::fs::write(
+            &rules_path,
+            "rule \"eq\" {\n  left = a\n  right = b\n  mapping = none\n}\n",
+        )
+        .unwrap();
+        let headers = engine::read_headers(&path, b',').unwrap();
+        let program = dsl::load_file(&rules_path).unwrap();
+        let plan = Arc::new(rules::compile(program, &headers).unwrap());
+
+        // limit 100 -> 10 rows per distinct condition.
+        let hits = collect_rule_hits(plan, 0, path, b',', 100, true).unwrap();
+        let repeated = hits
+            .hits
+            .iter()
+            .filter(|hit| hit.left == "x" && hit.right == "y")
+            .count();
+        assert_eq!(repeated, 10, "the repeated condition is capped at limit/10");
+        assert_eq!(hits.failed, 105);
+
+        let mut viewer = test_viewer();
+        viewer.rules.distinct = true;
+        viewer.rules.hits_filter = Some(RowOutcome::Failed);
+        viewer.rules.hits = Some(hits);
+        let _ = viewer.apply_rule_view();
+        // x|y plus the five distinct conditions.
+        assert_eq!(viewer.rows.len(), 15);
+        let headings = viewer
+            .row_groups
+            .iter()
+            .filter(|group| group.is_some())
+            .count();
+        assert_eq!(headings, 6, "each distinct condition gets one heading");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4693,6 +4905,7 @@ mod tests {
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
             cap: 100,
+            distinct: false,
             hits: vec![RowHit {
                 id: "1".into(),
                 row: None,
@@ -4722,6 +4935,7 @@ mod tests {
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
             cap: 100,
+            distinct: false,
             hits: (0..5)
                 .map(|index| RowHit {
                     id: index.to_string(),
@@ -4794,6 +5008,7 @@ mod tests {
         viewer.rules.hits = Some(RuleHits {
             rule: 0,
             cap: 100,
+            distinct: false,
             hits: Vec::new(),
             rows: Vec::new(),
             passed: 0,
