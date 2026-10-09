@@ -50,7 +50,11 @@
 //! the `attribute = value` label. Clicking a chip copies its value (a tooltip
 //! reveals values clipped by the two-line limit, and a double click opens the
 //! row form), and clicking a table row — or the empty part of a chip row —
-//! opens the form directly. The form closes
+//! opens the form directly. The form lists the visible attributes by default;
+//! an **all attributes** toggle reveals the ones hidden from the grid (and, in
+//! "rule attributes only" mode, the rest of the row) while a **filter
+//! attributes** box keeps only the names that contain the typed text. The form
+//! closes
 //! with its button, the Escape key, or a click on the backdrop. Escape also
 //! clears the regex or attribute filter the user was last editing.
 //!
@@ -418,6 +422,20 @@ fn hidden_note(count: usize) -> String {
     }
 }
 
+/// Attribute count shown under the detail-form title. `shown` is how many
+/// attributes the filter kept and `listed` how many were listed before it ran.
+/// The "of" form only appears while a filter is narrowing the list.
+fn attribute_count_label(shown: usize, listed: usize) -> String {
+    if listed > shown {
+        return format!("{shown} of {listed} attributes");
+    }
+    if shown == 1 {
+        "1 attribute".to_string()
+    } else {
+        format!("{shown} attributes")
+    }
+}
+
 /// Status line for the current scan. `rows_read` is the number of data rows
 /// read; when the scan was not truncated it is the total number of rows in the
 /// file. `elapsed` appends how long the search itself took.
@@ -603,6 +621,11 @@ enum Message {
     Escape,
     /// Copy an attribute value from the detail form: `(attribute, value)`.
     CopyValue(String, String),
+    /// Show every attribute in the detail form, including those hidden from the
+    /// grid and, when "rule attributes only" is on, those the rule ignores.
+    ToggleDetailAll(bool),
+    /// The detail form's attribute-name "contains" filter changed.
+    DetailFilterChanged(String),
     /// Hide an attribute (column index) from the rows.
     Mute(usize),
     /// Show a previously hidden attribute again.
@@ -686,6 +709,11 @@ struct Viewer {
     /// Attribute whose value was last copied from the detail form, so the form
     /// can confirm the copy.
     copy_notice: Option<String>,
+    /// Show every attribute in the detail form instead of only the visible ones.
+    detail_show_all: bool,
+    /// Case-insensitive "contains" filter on the attribute names listed by the
+    /// detail form.
+    detail_filter: String,
     /// Whether the rule-evaluation panel is open.
     show_rules: bool,
     /// Whether the configuration panel is open.
@@ -774,6 +802,8 @@ impl Viewer {
             row_groups: Vec::new(),
             detail: None,
             copy_notice: None,
+            detail_show_all: false,
+            detail_filter: String::new(),
             show_rules: false,
             show_config: true,
             rules: RulesState::default(),
@@ -1454,6 +1484,14 @@ impl Viewer {
             Message::CopyValue(attribute, value) => {
                 self.copy_notice = Some(attribute);
                 iced::clipboard::write(value)
+            }
+            Message::ToggleDetailAll(show_all) => {
+                self.detail_show_all = show_all;
+                Task::none()
+            }
+            Message::DetailFilterChanged(filter) => {
+                self.detail_filter = filter;
+                Task::none()
             }
             Message::Mute(index) => {
                 // A pinned column is always visible, so hiding it is ignored.
@@ -2799,12 +2837,20 @@ impl Viewer {
             .into();
 
         // The row detail form floats above the table; `opaque` keeps clicks on
-        // the backdrop from reaching the rows underneath. When it was opened
-        // from the rules panel and the "rule attributes only" mode is on, only
-        // the columns the rule references are shown.
+        // the backdrop from reaching the rows underneath.
+        //
+        // Which attributes it lists: by default the form follows the grid, so an
+        // attribute hidden from the rows is hidden here too (and when it was
+        // opened from the rules panel with "rule attributes only" on, only the
+        // columns the rule references are shown). The form's "all attributes"
+        // toggle drops both restrictions and lists every column, while its
+        // filter box keeps the attributes whose name contains the typed text.
         match &self.detail {
             Some(detail) => {
-                let fields: Vec<(String, String)> = if self.rules.attrs_only {
+                let needle = self.detail_filter.trim().to_lowercase();
+                let mut fields: Vec<(String, String)> = if self.detail_show_all {
+                    detail.fields.clone()
+                } else if self.rules.attrs_only {
                     detail
                         .rule
                         .map(|rule| {
@@ -2819,13 +2865,26 @@ impl Viewer {
                         })
                         .unwrap_or_else(|| detail.fields.clone())
                 } else {
-                    detail.fields.clone()
+                    detail
+                        .fields
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, _)| !self.muted.contains(index))
+                        .map(|(_, pair)| pair.clone())
+                        .collect()
                 };
+                let listed = fields.len();
+                if !needle.is_empty() {
+                    fields.retain(|(name, _)| name.to_lowercase().contains(&needle));
+                }
                 stack([
                     content,
                     detail_form(
                         &detail.title,
                         &fields,
+                        listed,
+                        &self.detail_filter,
+                        self.detail_show_all,
                         self.copy_notice.as_deref(),
                         self.window_width,
                         &theme,
@@ -3476,6 +3535,9 @@ const FORM_ROW_HEIGHT: f32 = 36.0;
 fn detail_form<'a>(
     title: &'a str,
     fields: &[(String, String)],
+    listed: usize,
+    filter: &'a str,
+    show_all: bool,
     copy_notice: Option<&str>,
     window_width: f32,
     theme: &Theme,
@@ -3517,6 +3579,18 @@ fn detail_form<'a>(
         );
     }
 
+    if fields.is_empty() {
+        form = form.push(
+            text(if listed == 0 {
+                "no attributes to show".to_string()
+            } else {
+                "no attributes match the filter".to_string()
+            })
+            .size(13)
+            .color(muted_text(theme)),
+        );
+    }
+
     // Header: a tinted glyph, the match number and a short attribute count.
     let heading = row![
         container(
@@ -3538,13 +3612,9 @@ fn detail_form<'a>(
         }),
         column![
             text(title).size(17),
-            text(if fields.len() == 1 {
-                "1 attribute".to_string()
-            } else {
-                format!("{} attributes", fields.len())
-            })
-            .size(12)
-            .color(muted_text(theme)),
+            text(attribute_count_label(fields.len(), listed))
+                .size(12)
+                .color(muted_text(theme)),
         ]
         .spacing(2),
     ]
@@ -3575,11 +3645,31 @@ fn detail_form<'a>(
             .style(secondary_button),
     );
 
-    // Keep the body height in step with the fixed-height field rows above.
-    let body_height = (fields.len() as f32 * FORM_ROW_HEIGHT).clamp(60.0, 440.0);
+    // Attribute controls for the form: a "contains" filter over the attribute
+    // names and a toggle that reveals the attributes hidden from the grid.
+    let controls = row![
+        text_input("filter attributes…", filter)
+            .on_input(Message::DetailFilterChanged)
+            .padding(8)
+            .size(13)
+            .style(input_style)
+            .width(Length::Fill),
+        checkbox("all attributes", show_all)
+            .on_toggle(Message::ToggleDetailAll)
+            .text_size(12)
+            .style(checkbox_style),
+    ]
+    .spacing(10)
+    .align_y(Center);
+
+    // Size the body from the attributes listed before filtering, not from the
+    // rows the filter kept, so typing in the filter box does not resize the
+    // panel (the field rows above have a fixed height).
+    let body_height = (listed as f32 * FORM_ROW_HEIGHT).clamp(60.0, 440.0);
     let panel = container(
         column![
             header,
+            controls,
             horizontal_rule(1).style(divider_style),
             scrollable(form)
                 .height(Length::Fixed(body_height))
