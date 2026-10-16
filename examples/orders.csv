@@ -1,0 +1,8 @@
+order_id,product,region,warehouse
+O1,widget,EU,WH-EU
+O2,widget,US,WH-US
+O3,gadget,EU,WH-EU
+O4,gizmo,APAC,WH-APAC
+O5,widget,EU,WH-US
+O6,gadget,US,WH-US
+O7,gizmo,APAC,WH-EU

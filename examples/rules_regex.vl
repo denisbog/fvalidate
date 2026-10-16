@@ -1,0 +1,43 @@
+# Regex support, mirroring xan's `regex(...)` expressions.
+#
+# Run with:
+#   fvalidate examples/contacts.csv -r examples/rules_regex.vl --id-column contact_id
+
+defaults {
+  report_limit = 10
+}
+
+# 1. `replace(regex(...), replacement)` is a regex replacement: strip every
+#    non-digit character before comparing the raw phone to the digit column.
+rule "phone digits extracted by regex replace" {
+  left           = phone_raw
+  right          = phone_digits
+  transform_left = replace(regex("[^0-9]"), "")
+}
+
+# 2. Single-column regex validation: a rule-level `pattern` with
+#    `compare = matches`. `right` is omitted because the pattern is the
+#    expectation.
+rule "email looks like an email" {
+  left    = email
+  pattern = "^[^@[:space:]]+@[^@[:space:]]+\\.[A-Za-z]{2,}$"
+  compare = matches
+}
+
+# 3. `match(regex(...), group)` extracts capture group N (xan's match()),
+#    leaving the value untouched and flagging a transform error on no match.
+rule "email local part extracted by capture group" {
+  left           = email
+  right          = email_user
+  transform_left = match(regex("^([^@]+)@"), 1)
+}
+
+# 4. Regex separator: multi-value cells split on any of ";", "," or "|"
+#    surrounded by optional whitespace, then compared as unordered sets.
+rule "tags agree as sets (regex separator)" {
+  left      = tags
+  right     = ref_tags
+  multi     = true
+  separator = regex("\\s*[;,|]\\s*")
+  compare   = eq
+}

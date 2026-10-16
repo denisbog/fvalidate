@@ -1,0 +1,9 @@
+id,country_name,country_code,start_date,end_date,tags,ref_tags,city,city_code
+1,France,FR,2020-01-01,2020-01-01,a;b,a;b,Paris,PAR
+2,France,FR,01/02/2020,2020-02-01,b;c,c;b,Lyon,LYO
+3,USA,US,2020-03-01,2020-04-01,x,x,Paris,PAR
+4,United States,US,2020-03-01,2020-03-01,y,z,London,LON
+5,France,US,2020-05-01,2020-05-01,a,a,Paris,PAR
+6,Germany,DE,not-a-date,2020-06-01,p;q,p;q,Berlin,BER
+7,France,FR,2020-07-01,2020-07-02,a,a,Paris,PAR
+8,france,FR,2020-08-01,2020-08-01,b,b,Lyon,LYO

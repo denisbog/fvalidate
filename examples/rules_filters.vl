@@ -1,0 +1,47 @@
+# Fallback columns (`or(...)`), skip predicates and mapping filters.
+#
+# Run with:
+#   fvalidate examples/loose.csv -r examples/rules_filters.vl --id-column id
+
+# `or(a, b, c)` uses the first non-empty column as the source value.
+rule "fallback picks the first available code" {
+  left  = or(code_a, code_b, code_c)
+  right = expected
+  compare = eq
+}
+
+# `validation_skipped` marks matching rows as skipped instead of failed.
+rule "archived rows are skipped" {
+  left  = or(code_a, code_b, code_c)
+  right = expected
+  validation_skipped = in(status, ["archived", "deleted"])
+}
+
+# `any_in` skips a row when any of the listed columns holds one of the values.
+rule "sentinel rows are skipped" {
+  left  = or(code_a, code_b, code_c)
+  right = expected
+  validation_skipped = any_in([code_a, code_b, code_c], ["SKIP", "N/A"])
+}
+
+# `mapping_filter` selects which *reference rows* define the mapping: only rows
+# whose `category` column is "standard" are loaded. The `LEGACY` entry is
+# ignored, so that data value is reported as unmapped.
+rule "only standard reference rows define the mapping" {
+  left           = or(code_a, code_b, code_c)
+  right          = expected
+  mapping_files  = ["examples/loose_map.csv"]
+  mapping_left   = code
+  mapping_right  = expected
+  mapping_filter = eq(category, "standard")
+}
+
+# For an `auto` mapping the filter runs over the *data* rows: only primary rows
+# are observed when the relation is extracted. Filtered rows are still
+# validated (unlike `validation_skipped`).
+rule "auto mapping only sees primary rows" {
+  left           = or(code_a, code_b, code_c)
+  right          = expected
+  mapping        = auto
+  mapping_filter = eq(kind, "primary")
+}

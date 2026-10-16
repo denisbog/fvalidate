@@ -1,0 +1,35 @@
+# `trim` and optional relations (`allow_empty`).
+#
+# Run with:
+#   fvalidate examples/members.csv -r examples/rules_optional.vl --id-column member_id
+
+defaults {
+  report_limit = 10
+}
+
+# `trim = true` strips surrounding whitespace from each cell (and from the
+# reference values), so " France " is looked up as "France".
+# `allow_empty = true` makes the relation optional: when both the source and the
+# target are empty the row is *skipped*, not reported as a failure. Rows M3
+# (empty) and M5 (whitespace only, empty after trimming) are skipped.
+rule "country code from reference (trim + optional)" {
+  left          = country_name
+  right         = country_code
+  trim          = true
+  allow_empty   = true
+  mapping_files = ["examples/country_codes.csv"]
+  mapping_left  = country_name
+  mapping_right = country_code
+}
+
+# Same reference lookup without `trim`: padded and whitespace-only values are
+# not recognized, so M1 and M5 fail. `allow_empty` still skips M3 because both
+# cells are truly empty.
+rule "country code from reference (no trim, failures)" {
+  left          = country_name
+  right         = country_code
+  allow_empty   = true
+  mapping_files = ["examples/country_codes.csv"]
+  mapping_left  = country_name
+  mapping_right = country_code
+}

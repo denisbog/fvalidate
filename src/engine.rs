@@ -1,0 +1,1739 @@
+//! Validation engine.
+//!
+//! Design (mirroring `xan`):
+//!
+//! * parsing is delegated to the SIMD-accelerated `simd-csv` reader using a
+//!   single reusable `ByteRecord` (no per-row allocation);
+//! * when the file is seekable it is split into record-aligned byte segments
+//!   with `simd_csv::Seeker`, then each segment is read independently by a
+//!   rayon worker — the same strategy xan uses for parallel commands;
+//! * rules are compiled to integer column indices once, and the hot loop only
+//!   does O(1) indexing and cheap `Cow` transforms;
+//! * matching/failing rows are aggregated by their `(left, right, expected)`
+//!   values, and each group keeps a bounded, deterministic sample of ids;
+//!   ambiguity examples use the same bounded min-hash reservoir. The number of
+//!   distinct result groups follows the data cardinality, as in the
+//!   development branch.
+
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use rayon::prelude::*;
+use regex::Regex;
+use simd_csv::ByteRecord;
+
+use crate::compare::CompareOp;
+use crate::expr::{self, EvalContext, Expr, Value, ValueRef};
+use crate::mapping::{self, MapCounts, Mapping, MappingOrigin};
+use crate::pattern::Separator;
+use crate::progress::Progress;
+use crate::report::{
+    AmbiguityReport, Example, GroupedExample, MappingEntry, MappingReport, Report, RowHit,
+    RowOutcome, RuleReport, TargetExample,
+};
+use crate::dsl::FallbackMode;
+use crate::rules::{
+    ColumnRef, CompiledPredicate, CompiledRule, MappingPlan, MappingSourcePlan, Plan,
+};
+use crate::sampler::{fnv1a, Sampler};
+use crate::transform::{compose, Transform};
+
+const BUFFER_CAPACITY: usize = 64 * 1024;
+
+/// A predicate over a raw CSV record that restricts which rows the engine
+/// evaluates. Rows for which it returns `false` are not counted, validated or
+/// used to build an auto-extracted mapping. `fview` uses it for its
+/// "filtered rows only" rule mode, where the search filter selects the rows.
+#[derive(Clone)]
+pub struct RowFilter(Arc<dyn Fn(&ByteRecord) -> bool + Send + Sync>);
+
+impl RowFilter {
+    /// Wrap a `Send + Sync` predicate. The engine calls it once per data row,
+    /// so it should be cheap; compiled regexes and masks are the intended use.
+    #[allow(dead_code)] // used by the GUI (`gui` feature)
+    pub fn new(filter: impl Fn(&ByteRecord) -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(filter))
+    }
+
+    /// Whether `record` should be evaluated. Exposed so callers (and tests) can
+    /// check a filter without running the engine.
+    pub fn matches(&self, record: &ByteRecord) -> bool {
+        (self.0)(record)
+    }
+}
+
+impl std::fmt::Debug for RowFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RowFilter")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EngineConfig {
+    pub path: PathBuf,
+    pub delimiter: u8,
+    pub threads: usize,
+    pub id_idx: Option<usize>,
+    pub progress: Option<Arc<Progress>>,
+    /// When `Some(index)`, every row of that rule (all outcomes) is
+    /// collected (in file order) into `RuleReport::hits`. Used by the GUI's
+    /// "show all rows" action; the regular report stays bounded otherwise.
+    pub collect_hits: Option<usize>,
+    /// Maximum number of `RuleReport::hits` retained *per outcome* when
+    /// `collect_hits` is set. Capping per outcome (rather than overall) keeps
+    /// every outcome browsable: the GUI passes its row limit so "show all /
+    /// passed / failed / skipped" can each display that many rows without
+    /// materializing the whole rule. Use `usize::MAX` to keep every row.
+    pub collect_hits_limit: usize,
+    /// When true, `collect_hits` retains a row only if its
+    /// `(left, right, expected)` condition has fewer than
+    /// `collect_hits_limit / 10` rows so far. This samples *distinct* outcomes
+    /// instead of filling the budget with rows that all failed the same way.
+    pub collect_distinct: bool,
+    /// Optional predicate restricting which data rows are read. Rows for which
+    /// it returns `false` are skipped entirely: they are not counted, validated
+    /// or used to build an auto-extracted mapping. `None` reads every row.
+    pub row_filter: Option<RowFilter>,
+}
+
+/// Read the header row of the main input.
+pub fn read_headers(path: &Path, delimiter: u8) -> Result<Vec<String>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder.delimiter(delimiter).has_headers(true);
+    let mut reader = builder.from_reader(file);
+
+    let headers = reader
+        .byte_headers()
+        .map_err(|e| format!("cannot read headers of {}: {e}", path.display()))?;
+
+    Ok(headers
+        .iter()
+        .map(|c| String::from_utf8_lossy(c).into_owned())
+        .collect())
+}
+
+/// Compute record-aligned byte segments for parallel processing.
+pub fn segments_for(path: &Path, delimiter: u8, count: usize) -> Result<Vec<(u64, u64)>, String> {
+    let file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+
+    let mut builder = simd_csv::SeekerBuilder::new();
+    builder.delimiter(delimiter).has_headers(true);
+
+    let seeker = builder
+        .from_reader(file)
+        .map_err(|e| format!("cannot seek {}: {e}", path.display()))?;
+
+    let Some(mut seeker) = seeker else {
+        return Ok(Vec::new());
+    };
+
+    let ranges = seeker
+        .segments(count.max(1))
+        .map_err(|e| format!("cannot split {}: {e}", path.display()))?;
+
+    Ok(ranges.into_iter().filter(|(from, to)| to > from).collect())
+}
+
+/// A `Read` adapter that reports how many bytes were consumed.
+struct CountingReader<R> {
+    inner: R,
+    progress: Option<Arc<Progress>>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        if let Some(progress) = &self.progress {
+            progress.tick(read as u64);
+        }
+        Ok(read)
+    }
+}
+
+fn open_segment(
+    path: &Path,
+    delimiter: u8,
+    from: u64,
+    to: u64,
+    progress: Option<&Arc<Progress>>,
+) -> Result<simd_csv::Reader<CountingReader<std::io::Take<File>>>, String> {
+    let mut file = File::open(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(from))
+        .map_err(|e| format!("cannot seek {}: {e}", path.display()))?;
+
+    let limited = file.take(to.saturating_sub(from));
+    let counted = CountingReader {
+        inner: limited,
+        progress: progress.cloned(),
+    };
+    let mut builder = simd_csv::ReaderBuilder::with_capacity(BUFFER_CAPACITY);
+    builder
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true);
+
+    Ok(builder.from_reader(counted))
+}
+
+// ---------------------------------------------------------------------------
+// Accumulators
+// ---------------------------------------------------------------------------
+
+/// Aggregates matching/failing rows by their `(left, right, expected)` values
+/// and keeps up to `limit` example ids per group. Groups are merged across
+/// parallel segments and the most frequent groups are reported first.
+type GroupKey = (String, String, Option<String>);
+
+#[derive(Default)]
+struct GroupEntry {
+    count: u64,
+    /// Up to `limit` ids with the smallest FNV-1a hash, sorted by hash so the
+    /// retained sample is deterministic and independent of segment order.
+    ids: Vec<(u64, String)>,
+}
+
+struct ResultGroups {
+    /// Zero disables collection entirely (report limit of zero).
+    limit: usize,
+    groups: HashMap<GroupKey, GroupEntry>,
+}
+
+impl ResultGroups {
+    fn new(limit: usize) -> Self {
+        ResultGroups {
+            limit,
+            groups: HashMap::new(),
+        }
+    }
+
+    fn is_disabled(&self) -> bool {
+        self.limit == 0
+    }
+
+    /// Record one matching or failing row under its `(left, right, expected)`
+    /// condition, keeping up to `limit` example ids for that condition.
+    fn observe(&mut self, left: &str, right: &str, expected: Option<&str>, id: &str) {
+        if self.limit == 0 {
+            return;
+        }
+        let entry = self
+            .groups
+            .entry((
+                left.to_string(),
+                right.to_string(),
+                expected.map(str::to_string),
+            ))
+            .or_default();
+        entry.count += 1;
+        offer_id(&mut entry.ids, self.limit, id);
+    }
+
+    fn merge(&mut self, other: ResultGroups) {
+        if other.limit > self.limit {
+            self.limit = other.limit;
+        }
+        for (key, other_entry) in other.groups {
+            let entry = self.groups.entry(key).or_default();
+            entry.count += other_entry.count;
+            for (_, id) in other_entry.ids {
+                offer_id(&mut entry.ids, self.limit, &id);
+            }
+        }
+    }
+
+    /// The `limit` most frequent groups, most frequent first (ties broken by
+    /// value, so the report is deterministic).
+    fn top(&self) -> Vec<GroupedExample> {
+        let mut list: Vec<(&GroupKey, &GroupEntry)> = self.groups.iter().collect();
+        list.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        list.into_iter()
+            .take(self.limit)
+            .map(|(key, entry)| GroupedExample {
+                left: key.0.clone(),
+                right: key.1.clone(),
+                expected: key.2.clone(),
+                count: entry.count,
+                ids: entry.ids.iter().map(|(_, id)| id.clone()).collect(),
+            })
+            .collect()
+    }
+}
+
+/// Keep the `limit` smallest-hash ids, sorted by hash. Using a hash order (and
+/// not the encounter order) makes the retained sample deterministic when
+/// parallel segments are merged in arbitrary order.
+fn offer_id(ids: &mut Vec<(u64, String)>, limit: usize, id: &str) {
+    if limit == 0 || ids.iter().any(|(_, existing)| existing == id) {
+        return;
+    }
+    let hash = fnv1a(id.as_bytes());
+    if ids.len() < limit {
+        let pos = ids.partition_point(|(h, _)| *h < hash);
+        ids.insert(pos, (hash, id.to_string()));
+        return;
+    }
+    if let Some(&(worst, _)) = ids.last() {
+        if hash < worst {
+            ids.pop();
+            let pos = ids.partition_point(|(h, _)| *h < hash);
+            ids.insert(pos, (hash, id.to_string()));
+        }
+    }
+}
+
+struct RuleAccum {
+    checked: u64,
+    passed: u64,
+    failed: u64,
+    skipped: u64,
+    /// Rows skipped by an explicit `validation_skipped` predicate.
+    validation_skipped: u64,
+    transform_errors: u64,
+    unmapped: u64,
+    pass_results: ResultGroups,
+    fail_results: ResultGroups,
+    /// Rows skipped by the explicit `validation_skipped` predicate, grouped the
+    /// same way as the matching and failing results.
+    skip_results: ResultGroups,
+    /// Every row of the rule, collected only when `collect_hits` selects it.
+    hits: Vec<RowHit>,
+    /// Maximum hits kept per outcome (see `EngineConfig::collect_hits_limit`).
+    hits_limit: usize,
+    /// How many hits of each outcome `hits` currently holds, indexed by
+    /// `RowOutcome::index`.
+    hits_collected: [usize; 4],
+    /// When true, retained hits are capped per `(left, right, expected)`
+    /// condition, not only per outcome.
+    distinct: bool,
+    /// Rows kept per distinct condition (see `EngineConfig::collect_distinct`).
+    distinct_limit: usize,
+    /// Per outcome, how many rows each condition has already contributed.
+    condition_counts: [HashMap<GroupKey, usize>; 4],
+    /// Keyed by the ambiguous input value, so up to `limit` distinct inputs are
+    /// reported.
+    ambiguous_samples: Sampler<Example>,
+}
+
+impl RuleAccum {
+    fn new(limit: usize, hits_limit: usize, distinct: bool) -> Self {
+        RuleAccum {
+            checked: 0,
+            passed: 0,
+            failed: 0,
+            skipped: 0,
+            validation_skipped: 0,
+            transform_errors: 0,
+            unmapped: 0,
+            pass_results: ResultGroups::new(limit),
+            fail_results: ResultGroups::new(limit),
+            skip_results: ResultGroups::new(limit),
+            hits: Vec::new(),
+            hits_limit,
+            hits_collected: [0; 4],
+            distinct,
+            // At most a tenth of the budget per condition, so up to ten
+            // distinct conditions are represented.
+            distinct_limit: if distinct {
+                (hits_limit / 10).max(1)
+            } else {
+                usize::MAX
+            },
+            condition_counts: std::array::from_fn(|_| HashMap::new()),
+            ambiguous_samples: Sampler::new(limit),
+        }
+    }
+
+    /// Whether another hit with this outcome fits under the per-outcome cap.
+    fn wants_hit(&self, outcome: RowOutcome) -> bool {
+        self.hits_collected[outcome.index()] < self.hits_limit
+    }
+
+    /// Whether a hit for this condition fits under the per-outcome cap and, in
+    /// distinct mode, under the per-condition cap.
+    fn wants_condition(
+        &self,
+        outcome: RowOutcome,
+        left: &str,
+        right: &str,
+        expected: Option<&str>,
+    ) -> bool {
+        if !self.wants_hit(outcome) {
+            return false;
+        }
+        if !self.distinct {
+            return true;
+        }
+        let key = (
+            left.to_string(),
+            right.to_string(),
+            expected.map(str::to_string),
+        );
+        self.condition_counts[outcome.index()]
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
+            < self.distinct_limit
+    }
+
+    /// Record a hit and count it against the per-outcome and per-condition caps.
+    fn push_hit(&mut self, hit: RowHit) {
+        self.hits_collected[hit.outcome.index()] += 1;
+        if self.distinct {
+            let key = (hit.left.clone(), hit.right.clone(), hit.expected.clone());
+            *self.condition_counts[hit.outcome.index()]
+                .entry(key)
+                .or_insert(0) += 1;
+        }
+        self.hits.push(hit);
+    }
+
+    fn merge(&mut self, other: RuleAccum) {
+        self.checked += other.checked;
+        self.passed += other.passed;
+        self.failed += other.failed;
+        self.skipped += other.skipped;
+        self.validation_skipped += other.validation_skipped;
+        self.transform_errors += other.transform_errors;
+        self.unmapped += other.unmapped;
+        self.pass_results.merge(other.pass_results);
+        self.fail_results.merge(other.fail_results);
+        self.skip_results.merge(other.skip_results);
+        // Another pass may have hit the cap for an outcome; only keep what still
+        // fits, preserving file order across the merged segments.
+        for hit in other.hits {
+            if self.wants_condition(
+                hit.outcome,
+                &hit.left,
+                &hit.right,
+                hit.expected.as_deref(),
+            ) {
+                self.push_hit(hit);
+            }
+        }
+        self.ambiguous_samples.merge(other.ambiguous_samples);
+    }
+}
+
+/// A compiled `derive` clause with its column references remapped to positions
+/// in the extracted per-row cell vector.
+#[derive(Debug, Clone)]
+struct DerivedSlot {
+    /// How many named outputs the clause produces.
+    names: usize,
+    expr: Expr,
+}
+
+/// Column slots so the hot loop indexes a small per-row vector instead of
+/// repeatedly hashing header names.
+struct Slots {
+    needed: Vec<usize>,
+    /// Maps a CSV column index to its position in the extracted cell vector.
+    slot_of: Vec<usize>,
+    id_slot: Option<usize>,
+    /// Per rule: compiled `derive` clauses, in evaluation order.
+    rule_derive: Vec<Vec<DerivedSlot>>,
+}
+
+impl Slots {
+    fn build(plan: &Plan, id_idx: Option<usize>) -> Self {
+        let mut needed: Vec<usize> = Vec::with_capacity(plan.rules.len() * 2 + 1);
+        for rule in &plan.rules {
+            rule.left.collect_columns(&mut needed);
+            rule.right.collect_columns(&mut needed);
+            if let MappingPlan::Files(sources) = &rule.mapping {
+                for source in sources {
+                    source.key.collect_columns(&mut needed);
+                }
+            }
+            if let Some(predicate) = &rule.skip {
+                predicate.collect_indices(&mut needed);
+            }
+            if let Some(predicate) = &rule.auto_mapping_filter {
+                predicate.collect_indices(&mut needed);
+            }
+            for derived in &rule.derive {
+                derived.expr.column_refs(&mut needed);
+            }
+        }
+        if let Some(id) = id_idx {
+            needed.push(id);
+        }
+        needed.sort_unstable();
+        needed.dedup();
+
+        let width = needed.last().map_or(0, |&column| column + 1);
+        let mut slot_of = vec![usize::MAX; width];
+        for (slot, &column) in needed.iter().enumerate() {
+            slot_of[column] = slot;
+        }
+        let id_slot = id_idx.map(|id| slot_of[id]);
+
+        // Remap each rule's `derive` expressions from input column indices to
+        // positions in the extracted `cells` vector.
+        let rule_derive = plan
+            .rules
+            .iter()
+            .map(|rule| {
+                rule.derive
+                    .iter()
+                    .map(|derived| {
+                        let mut expr = derived.expr.clone();
+                        expr.remap_refs(&mut |reference| match reference {
+                            ValueRef::Column(index) => ValueRef::Column(slot_of[index]),
+                            other => other,
+                        });
+                        DerivedSlot {
+                            names: derived.names.len(),
+                            expr,
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        Slots {
+            needed,
+            slot_of,
+            id_slot,
+            rule_derive,
+        }
+    }
+
+    /// The extracted cell for a CSV column (empty when the row is short).
+    #[inline]
+    fn cell<'a>(&self, cells: &'a [String], column: usize) -> &'a str {
+        cells[self.slot_of[column]].as_str()
+    }
+
+    #[inline]
+    fn extract(&self, record: &ByteRecord, cells: &mut Vec<String>) {
+        if cells.len() < self.needed.len() {
+            cells.resize_with(self.needed.len(), String::new);
+        }
+        for (slot, &column) in self.needed.iter().enumerate() {
+            let raw = record.get(column).unwrap_or(b"");
+            let cell = &mut cells[slot];
+            cell.clear();
+            cell.push_str(&String::from_utf8_lossy(raw));
+        }
+    }
+}
+
+/// Compose one side of a rule into `out`. `Or` selects the first non-empty
+/// candidate column before applying the transform pipeline.
+#[allow(clippy::too_many_arguments)]
+/// Evaluate a rule's `derive` block, appending the named outputs to `derived`.
+#[inline]
+fn evaluate_derived(
+    slots: &[DerivedSlot],
+    cells: &[String],
+    separator: &Separator,
+    derived: &mut Vec<String>,
+) {
+    derived.clear();
+    if slots.is_empty() {
+        return;
+    }
+    let join = match separator {
+        Separator::Literal(literal) => literal.as_str(),
+        Separator::Regex(pattern) => pattern.as_str(),
+    };
+    for clause in slots {
+        let value = {
+            let ctx = EvalContext {
+                cells,
+                derived: derived.as_slice(),
+            };
+            expr::eval(&clause.expr, &ctx)
+        };
+
+        if clause.names > 1 {
+            if let Value::List(items) = value {
+                for index in 0..clause.names {
+                    derived.push(
+                        items
+                            .get(index)
+                            .map(|item| item.scalar_string(join))
+                            .unwrap_or_default(),
+                    );
+                }
+                continue;
+            }
+            derived.push(value.scalar_string(join));
+            for _ in 1..clause.names {
+                derived.push(String::new());
+            }
+        } else {
+            derived.push(value.scalar_string(join));
+        }
+    }
+}
+
+/// The string value of one side reference: an extracted cell or a derived
+/// output.
+#[inline]
+fn side_value<'a>(
+    reference: &ValueRef,
+    cells: &'a [String],
+    slots: &Slots,
+    derived: &'a [String],
+) -> &'a str {
+    match reference {
+        ValueRef::Column(index) => slots.cell(cells, *index),
+        ValueRef::Derived(index) => derived.get(*index).map(String::as_str).unwrap_or(""),
+    }
+}
+
+fn compose_side(
+    side: &ColumnRef,
+    cells: &[String],
+    slots: &Slots,
+    derived: &[String],
+    transforms: &[Transform],
+    join: &str,
+    trim: bool,
+    part: &mut String,
+    scratch: &mut String,
+    out: &mut String,
+) -> bool {
+    match side {
+        ColumnRef::Columns(values) => compose(
+            values
+                .iter()
+                .map(|reference| side_value(reference, cells, slots, derived)),
+            transforms,
+            join,
+            trim,
+            part,
+            scratch,
+            out,
+        ),
+        ColumnRef::Or(values) => {
+            let chosen = values
+                .iter()
+                .map(|reference| side_value(reference, cells, slots, derived))
+                .find(|value| !(if trim { value.trim() } else { *value }).is_empty());
+            match chosen {
+                Some(value) => compose(
+                    std::iter::once(value),
+                    transforms,
+                    join,
+                    trim,
+                    part,
+                    scratch,
+                    out,
+                ),
+                None => {
+                    out.clear();
+                    true
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate a compiled predicate against the extracted row cells.
+#[inline]
+fn predicate_holds(
+    predicate: &CompiledPredicate,
+    cells: &[String],
+    slots: &Slots,
+    trim: bool,
+) -> bool {
+    predicate.evaluate(&|column| slots.cell(cells, column), trim)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 1: build auto mappings
+// ---------------------------------------------------------------------------
+
+fn fill_tokens(buffer: &str, multi: bool, separator: &Separator, out: &mut Vec<String>) {
+    mapping::split_tokens_into(buffer, multi, separator, out);
+}
+
+/// Count records in one segment without applying any rule. Used to assign
+/// exact global row numbers when there is no id column, so validation can
+/// still run in parallel.
+fn count_rows_segment(
+    path: &Path,
+    delimiter: u8,
+    from: u64,
+    to: u64,
+    progress: Option<&Arc<Progress>>,
+) -> Result<u64, String> {
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
+    let mut record = ByteRecord::new();
+    let mut count = 0u64;
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => count += 1,
+            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
+        }
+    }
+    Ok(count)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_counts_segment(
+    path: &Path,
+    delimiter: u8,
+    rules: &[crate::rules::CompiledRule],
+    auto_indices: &[usize],
+    slots: &Slots,
+    filter: Option<&RowFilter>,
+    from: u64,
+    to: u64,
+    progress: Option<&Arc<Progress>>,
+) -> Result<Vec<MapCounts>, String> {
+    let mut result: Vec<MapCounts> = auto_indices.iter().map(|_| MapCounts::new()).collect();
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
+    let mut record = ByteRecord::new();
+    let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
+    let mut left_buf = String::new();
+    let mut right_buf = String::new();
+    let mut component_buf = String::new();
+    let mut component_buf2 = String::new();
+    let mut left_tokens: Vec<String> = Vec::new();
+    let mut right_tokens: Vec<String> = Vec::new();
+    let mut derived: Vec<String> = Vec::new();
+
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
+        }
+
+        if let Some(filter) = filter {
+            if !filter.matches(&record) {
+                continue;
+            }
+        }
+
+        slots.extract(&record, &mut cells);
+
+        for (position, &rule_index) in auto_indices.iter().enumerate() {
+            let rule = &rules[rule_index];
+
+            // Rows skipped for validation, or excluded by the auto-mapping
+            // filter, do not contribute to the extracted mapping.
+            if let Some(predicate) = &rule.skip {
+                if predicate_holds(predicate, &cells, slots, rule.trim) {
+                    continue;
+                }
+            }
+            if let Some(predicate) = &rule.auto_mapping_filter {
+                if !predicate_holds(predicate, &cells, slots, rule.trim) {
+                    continue;
+                }
+            }
+
+            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
+
+            compose_side(
+                &rule.left,
+                &cells,
+                slots,
+                &derived,
+                &rule.transform_left,
+                &rule.join_separator,
+                rule.trim,
+                &mut component_buf,
+                &mut component_buf2,
+                &mut left_buf,
+            );
+            compose_side(
+                &rule.right,
+                &cells,
+                slots,
+                &derived,
+                &rule.transform_right,
+                &rule.join_separator,
+                rule.trim,
+                &mut component_buf,
+                &mut component_buf2,
+                &mut right_buf,
+            );
+            fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
+            fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
+
+            let counts = &mut result[position];
+            for (left, right) in left_tokens.iter().zip(right_tokens.iter()) {
+                mapping::bump_counts(counts, left, right);
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2: validate
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn validate_segment(
+    path: &Path,
+    delimiter: u8,
+    rules: &[crate::rules::CompiledRule],
+    mappings: &[Vec<Arc<Mapping>>],
+    slots: &Slots,
+    filter: Option<&RowFilter>,
+    from: u64,
+    to: u64,
+    row_base: Option<u64>,
+    collect_hits: Option<usize>,
+    hits_limit: usize,
+    distinct: bool,
+    progress: Option<&Arc<Progress>>,
+) -> Result<Vec<RuleAccum>, String> {
+    let mut accums: Vec<RuleAccum> = rules
+        .iter()
+        .map(|rule| RuleAccum::new(rule.report_limit, hits_limit, distinct))
+        .collect();
+    let mut reader = open_segment(path, delimiter, from, to, progress)?;
+    let mut record = ByteRecord::new();
+    let mut cells: Vec<String> = Vec::with_capacity(slots.needed.len());
+
+    let mut expected_buf: Vec<String> = Vec::new();
+    let mut matched_buf: Vec<String> = Vec::new();
+    let mut left_buf = String::new();
+    let mut right_buf = String::new();
+    let mut component_buf = String::new();
+    let mut component_buf2 = String::new();
+    let mut single_buf = String::new();
+    let mut left_tokens: Vec<String> = Vec::new();
+    let mut right_tokens: Vec<String> = Vec::new();
+    let mut derived: Vec<String> = Vec::new();
+
+    let mut local_row: u64 = 0;
+
+    loop {
+        match reader.read_byte_record(&mut record) {
+            Ok(false) => break,
+            Ok(true) => {}
+            Err(e) => return Err(format!("error reading {}: {e}", path.display())),
+        }
+
+        local_row += 1;
+        let row_number = row_base.map(|base| base + local_row - 1);
+        if let Some(filter) = filter {
+            if !filter.matches(&record) {
+                continue;
+            }
+        }
+        slots.extract(&record, &mut cells);
+
+        for (rule_index, rule) in rules.iter().enumerate() {
+            let accum = &mut accums[rule_index];
+
+            evaluate_derived(&slots.rule_derive[rule_index], &cells, &rule.separator, &mut derived);
+
+            // An explicit `validation_skipped` predicate marks the row as
+            // skipped. `mapping_filter` no longer skips validation; it only
+            // selects which rows define the mapping.
+            if let Some(predicate) = &rule.skip {
+                if predicate_holds(predicate, &cells, slots, rule.trim) {
+                    accum.checked += 1;
+                    accum.validation_skipped += 1;
+                    let want_hit = collect_hits == Some(rule_index)
+                        && accum.wants_hit(RowOutcome::ValidationSkipped);
+                    if !accum.skip_results.is_disabled() || want_hit {
+                        // Compose the values anyway so the skipped rows are
+                        // reported next to the matching and failing ones.
+                        let _ = compose_side(
+                            &rule.left,
+                            &cells,
+                            slots,
+                            &derived,
+                            &rule.transform_left,
+                            &rule.join_separator,
+                            rule.trim,
+                            &mut component_buf,
+                            &mut component_buf2,
+                            &mut left_buf,
+                        );
+                        let _ = compose_side(
+                            &rule.right,
+                            &cells,
+                            slots,
+                            &derived,
+                            &rule.transform_right,
+                            &rule.join_separator,
+                            rule.trim,
+                            &mut component_buf,
+                            &mut component_buf2,
+                            &mut right_buf,
+                        );
+                        let id = row_id(slots, &cells, row_number, local_row);
+                        if !accum.skip_results.is_disabled() {
+                            accum.skip_results.observe(&left_buf, &right_buf, None, &id);
+                        }
+                        if want_hit
+                            && accum.wants_condition(
+                                RowOutcome::ValidationSkipped,
+                                &left_buf,
+                                &right_buf,
+                                None,
+                            )
+                        {
+                            accum.push_hit(RowHit {
+                                id,
+                                row: row_number,
+                                left: left_buf.clone(),
+                                right: right_buf.clone(),
+                                expected: None,
+                                outcome: RowOutcome::ValidationSkipped,
+                                cells: collect_cells(&record),
+                            });
+                        }
+                    }
+                    continue;
+                }
+            }
+
+            let rule_mappings = &mappings[rule_index];
+            let is_file_mapping =
+                matches!(rule.mapping, MappingPlan::Files(_)) && !rule_mappings.is_empty();
+
+            let right_ok = compose_side(
+                &rule.right,
+                &cells,
+                slots,
+                &derived,
+                &rule.transform_right,
+                &rule.join_separator,
+                rule.trim,
+                &mut component_buf,
+                &mut component_buf2,
+                &mut right_buf,
+            );
+
+            // A file mapping composes the key of whichever source decides the
+            // lookup (in the branch below). Every other rule keys on `left`.
+            let mut left_ok = true;
+            if !is_file_mapping {
+                left_ok = compose_side(
+                    &rule.left,
+                    &cells,
+                    slots,
+                    &derived,
+                    &rule.transform_left,
+                    &rule.join_separator,
+                    rule.trim,
+                    &mut component_buf,
+                    &mut component_buf2,
+                    &mut left_buf,
+                );
+            } else if rule.allow_empty {
+                // The optional-relation check needs the first source's key; the
+                // lookup loop recomposes it for each source.
+                if let MappingPlan::Files(sources) = &rule.mapping {
+                    left_ok = compose_side(
+                        &sources[0].key,
+                        &cells,
+                        slots,
+                        &derived,
+                        &rule.transform_left,
+                        &rule.join_separator,
+                        rule.trim,
+                        &mut component_buf,
+                        &mut component_buf2,
+                        &mut left_buf,
+                    );
+                }
+            }
+            // Optional relation: when both the source and the target are empty
+            // the row is skipped instead of being reported as a failure. For
+            // pattern rules there is no target, so an empty value is skipped.
+            if rule.allow_empty
+                && left_buf.is_empty()
+                && (rule.pattern.is_some() || right_buf.is_empty())
+            {
+                accum.checked += 1;
+                accum.skipped += 1;
+                if collect_hits == Some(rule_index)
+                    && accum.wants_condition(
+                        RowOutcome::Skipped,
+                        &left_buf,
+                        &right_buf,
+                        None,
+                    )
+                {
+                    let id = row_id(slots, &cells, row_number, local_row);
+                    accum.push_hit(RowHit {
+                        id,
+                        row: row_number,
+                        left: left_buf.clone(),
+                        right: right_buf.clone(),
+                        expected: None,
+                        outcome: RowOutcome::Skipped,
+                        cells: collect_cells(&record),
+                    });
+                }
+                continue;
+            }
+
+            // Regex rules only need the left value: the rule-level pattern
+            // decides the outcome, mirroring xan's `match(value, regex(...))`.
+            let id = row_id(slots, &cells, row_number, local_row);
+
+            let mut mapping: Option<&Mapping> = rule_mappings.first().map(Arc::as_ref);
+            let mut expected: &[String];
+            let mut matched;
+
+            if let Some(pattern) = &rule.pattern {
+                let is_match = pattern.is_match(&left_buf);
+                matched = match rule.compare {
+                    CompareOp::NotMatches => left_ok && !is_match,
+                    _ => left_ok && is_match,
+                };
+                expected = &[];
+            } else {
+                fill_tokens(&right_buf, rule.multi, &rule.separator, &mut right_tokens);
+
+                // Multi-target file mappings list several acceptable values for
+                // a key; the row passes when the right set satisfies the
+                // comparison against any one of them. Tracked here and resolved
+                // after the right tokens are normalized.
+                let mut multi_target = false;
+                let mut had_unmapped = false;
+                if is_file_mapping {
+                    let sources = match &rule.mapping {
+                        MappingPlan::Files(sources) => sources.as_slice(),
+                        _ => &[],
+                    };
+                    let (key_ok, chosen, multi, unmapped) = resolve_file_sources(
+                        sources,
+                        rule_mappings,
+                        rule,
+                        &cells,
+                        slots,
+                        &derived,
+                        &right_buf,
+                        &id,
+                        row_number,
+                        &mut component_buf,
+                        &mut component_buf2,
+                        &mut left_buf,
+                        &mut left_tokens,
+                        &mut expected_buf,
+                        accum,
+                    );
+                    left_ok &= key_ok;
+                    mapping = chosen;
+                    multi_target = multi;
+                    had_unmapped = unmapped;
+                    expected = &expected_buf;
+                } else {
+                    fill_tokens(&left_buf, rule.multi, &rule.separator, &mut left_tokens);
+                    if let Some(current) = mapping {
+                        let mut count = 0usize;
+                        for token in &left_tokens {
+                            if current.multi_target {
+                                let targets = current.targets_for(token);
+                                if targets.is_empty() {
+                                    accum.unmapped += 1;
+                                    had_unmapped = true;
+                                    // `\u{0}` cannot appear in a real target, so
+                                    // this sentinel can never accidentally match.
+                                    let slot = token_slot(&mut expected_buf, count);
+                                    slot.push('\u{0}');
+                                    slot.push_str(token);
+                                    count += 1;
+                                } else {
+                                    for (target, _) in targets {
+                                        token_slot(&mut expected_buf, count).push_str(target);
+                                        count += 1;
+                                    }
+                                }
+                                continue;
+                            }
+
+                            match current.expected(token) {
+                                Some(target) => {
+                                    token_slot(&mut expected_buf, count).push_str(target)
+                                }
+                                None => {
+                                    accum.unmapped += 1;
+                                    let slot = token_slot(&mut expected_buf, count);
+                                    slot.push('\u{0}');
+                                    slot.push_str(token);
+                                }
+                            }
+                            count += 1;
+
+                            if current.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled()
+                            {
+                                accum.ambiguous_samples.offer_with(token, || Example {
+                                    id: id.clone(),
+                                    row: row_number,
+                                    left: token.clone(),
+                                    right: right_buf.clone(),
+                                    expected: current.expected(token).map(str::to_string),
+                                });
+                            }
+                        }
+                        expected_buf.truncate(count);
+                        expected_buf.sort_unstable();
+                        expected_buf.dedup();
+                        expected = &expected_buf;
+                        multi_target = current.multi_target;
+                    } else {
+                        // No mapping: the transformed left value *is* the
+                        // expected set, so sort it in place instead of cloning.
+                        left_tokens.sort_unstable();
+                        left_tokens.dedup();
+                        expected = &left_tokens;
+                    }
+                }
+
+                right_tokens.sort_unstable();
+                right_tokens.dedup();
+
+                if multi_target {
+                    let mapping = mapping.expect("mapping is present for multi-target");
+                    matched = false;
+                    if left_ok && right_ok && !had_unmapped {
+                        if rule.compare == CompareOp::Ne {
+                            // `ne` accepts only when the right matches none of
+                            // the acceptable targets.
+                            matched = find_target_match(
+                                CompareOp::Eq,
+                                mapping,
+                                &left_tokens,
+                                &right_tokens,
+                                &mut single_buf,
+                            )
+                            .is_none();
+                        } else if let Some(target) = find_target_match(
+                            rule.compare,
+                            mapping,
+                            &left_tokens,
+                            &right_tokens,
+                            &mut single_buf,
+                        ) {
+                            // Report the value that actually matched instead of
+                            // the whole set of acceptable values.
+                            matched_buf.clear();
+                            matched_buf.push(target.to_string());
+                            expected = &matched_buf;
+                            matched = true;
+                        }
+                    }
+                } else {
+                    matched = left_ok && right_ok && rule.compare.evaluate(expected, &right_tokens);
+                }
+            }
+
+            accum.checked += 1;
+            if !left_ok || !right_ok {
+                accum.transform_errors += 1;
+            }
+
+            // Every row can optionally be retained, in file order, for the
+            // GUI's "show all rows" action; the normal report keeps only the
+            // bounded sample.
+            let want_hits = collect_hits == Some(rule_index);
+            if matched {
+                accum.passed += 1;
+                let want_hit = want_hits && accum.wants_hit(RowOutcome::Passed);
+                if !accum.pass_results.is_disabled() || want_hit {
+                    let expected_example =
+                        sample_expected(rule.pattern.as_ref(), mapping, expected);
+                    if !accum.pass_results.is_disabled() {
+                        accum.pass_results.observe(
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                            &id,
+                        );
+                    }
+                    if want_hit
+                        && accum.wants_condition(
+                            RowOutcome::Passed,
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                        )
+                    {
+                        accum.push_hit(RowHit {
+                            id: id.clone(),
+                            row: row_number,
+                            left: left_buf.clone(),
+                            right: right_buf.clone(),
+                            expected: expected_example,
+                            outcome: RowOutcome::Passed,
+                            cells: collect_cells(&record),
+                        });
+                    }
+                }
+            } else {
+                accum.failed += 1;
+                let want_hit = want_hits && accum.wants_hit(RowOutcome::Failed);
+                if !accum.fail_results.is_disabled() || want_hit {
+                    let expected_example =
+                        sample_expected(rule.pattern.as_ref(), mapping, expected);
+                    if !accum.fail_results.is_disabled() {
+                        accum.fail_results.observe(
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                            &id,
+                        );
+                    }
+                    if want_hit
+                        && accum.wants_condition(
+                            RowOutcome::Failed,
+                            &left_buf,
+                            &right_buf,
+                            expected_example.as_deref(),
+                        )
+                    {
+                        accum.push_hit(RowHit {
+                            id: id.clone(),
+                            row: row_number,
+                            left: left_buf.clone(),
+                            right: right_buf.clone(),
+                            expected: expected_example,
+                            outcome: RowOutcome::Failed,
+                            cells: collect_cells(&record),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(accums)
+}
+
+/// Copy every cell of a record into an owned `Vec<String>`. Used only when the
+/// GUI asks the engine to retain the full rows behind a rule's hits, so the
+/// rows come from the same parallel validation pass instead of a second read.
+fn collect_cells(record: &ByteRecord) -> Vec<String> {
+    record
+        .iter()
+        .map(|cell| String::from_utf8_lossy(cell).into_owned())
+        .collect()
+}
+
+/// A multi-target mapping stores several acceptable values per key. Return the
+/// first one that satisfies the comparison against the actual right set, so
+/// `eq` means "the right value is one of the mapped values" instead of "the
+/// right value equals the single canonical target".
+fn find_target_match<'a>(
+    compare: CompareOp,
+    mapping: &'a Mapping,
+    left_tokens: &[String],
+    right_tokens: &[String],
+    scratch: &mut String,
+) -> Option<&'a str> {
+    for token in left_tokens {
+        for (target, _) in mapping.targets_for(token) {
+            scratch.clear();
+            scratch.push_str(target);
+            if compare.evaluate(std::slice::from_ref(scratch), right_tokens) {
+                return Some(target);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a file-mapped rule against its ordered sources for one row.
+///
+/// Each source keys the row on its own input columns; sources are consulted in
+/// order and [`FallbackMode`] decides when to move on. The deciding source's
+/// key is left in `left_buf`/`left_tokens`, its targets in `expected_buf`, and
+/// the mapping it used is returned for the comparison. Also returns whether
+/// every source key composed cleanly and whether the row was unmapped.
+#[allow(clippy::too_many_arguments)]
+fn resolve_file_sources<'a>(
+    sources: &[MappingSourcePlan],
+    mappings: &'a [Arc<Mapping>],
+    rule: &CompiledRule,
+    cells: &[String],
+    slots: &Slots,
+    derived: &[String],
+    right_buf: &str,
+    id: &str,
+    row_number: Option<u64>,
+    component_buf: &mut String,
+    component_buf2: &mut String,
+    left_buf: &mut String,
+    left_tokens: &mut Vec<String>,
+    expected_buf: &mut Vec<String>,
+    accum: &mut RuleAccum,
+) -> (bool, Option<&'a Mapping>, bool, bool) {
+    let mut key_ok = true;
+    let last = sources.len().saturating_sub(1);
+    let mut deciding: Option<&Mapping> = None;
+
+    for (index, source) in sources.iter().enumerate() {
+        key_ok &= compose_side(
+            &source.key,
+            cells,
+            slots,
+            derived,
+            &rule.transform_left,
+            &rule.join_separator,
+            rule.trim,
+            component_buf,
+            component_buf2,
+            left_buf,
+        );
+        fill_tokens(left_buf, rule.multi, &rule.separator, left_tokens);
+
+        let mapping = &mappings[index];
+        let all_unmapped = left_tokens.iter().all(|token| {
+            if mapping.multi_target {
+                mapping.targets_for(token).is_empty()
+            } else {
+                mapping.expected(token).is_none()
+            }
+        });
+        let any_ambiguous = left_tokens.iter().any(|token| mapping.is_ambiguous(token));
+        let more = index < last;
+        let consult_next = match source.when {
+            FallbackMode::Unmapped => all_unmapped && more,
+            FallbackMode::Ambiguous => (all_unmapped || any_ambiguous) && more,
+            FallbackMode::Always => more,
+        };
+        if consult_next {
+            continue;
+        }
+        deciding = Some(mapping);
+        break;
+    }
+
+    let mapping = deciding.expect("at least one source decides the lookup");
+    let mut had_unmapped = false;
+    let mut count = 0usize;
+    for token in left_tokens.iter() {
+        if mapping.multi_target {
+            let targets = mapping.targets_for(token);
+            if targets.is_empty() {
+                accum.unmapped += 1;
+                had_unmapped = true;
+                let slot = token_slot(expected_buf, count);
+                slot.push('\u{0}');
+                slot.push_str(token);
+                count += 1;
+            } else {
+                for (target, _) in targets {
+                    token_slot(expected_buf, count).push_str(target);
+                    count += 1;
+                }
+            }
+            continue;
+        }
+
+        match mapping.expected(token) {
+            Some(target) => token_slot(expected_buf, count).push_str(target),
+            None => {
+                accum.unmapped += 1;
+                had_unmapped = true;
+                let slot = token_slot(expected_buf, count);
+                slot.push('\u{0}');
+                slot.push_str(token);
+            }
+        }
+        count += 1;
+
+        if mapping.is_ambiguous(token) && !accum.ambiguous_samples.is_disabled() {
+            accum.ambiguous_samples.offer_with(token, || Example {
+                id: id.to_string(),
+                row: row_number,
+                left: token.clone(),
+                right: right_buf.to_string(),
+                expected: mapping.expected(token).map(str::to_string),
+            });
+        }
+    }
+    expected_buf.truncate(count);
+    expected_buf.sort_unstable();
+    expected_buf.dedup();
+    (key_ok, Some(mapping), mapping.multi_target, had_unmapped)
+}
+
+/// The id used to identify a row in the report: the trimmed id column, or a
+/// `row:N` pseudo-id when there is no id column (or the value is empty).
+#[inline]
+fn row_id(slots: &Slots, cells: &[String], row_number: Option<u64>, local_row: u64) -> String {
+    match slots.id_slot {
+        Some(slot) => {
+            let value = cells[slot].trim();
+            if value.is_empty() {
+                format!("row:{}", row_number.unwrap_or(local_row))
+            } else {
+                value.to_string()
+            }
+        }
+        None => format!("row:{}", row_number.unwrap_or(local_row)),
+    }
+}
+
+/// Return a cleared `String` at `index`, growing the buffer if needed. Used to
+/// reuse token storage across rows instead of allocating a new `String`.
+#[inline]
+fn token_slot(out: &mut Vec<String>, index: usize) -> &mut String {
+    if index >= out.len() {
+        out.push(String::new());
+    }
+    let slot = &mut out[index];
+    slot.clear();
+    slot
+}
+
+fn sample_expected(
+    pattern: Option<&Regex>,
+    mapping: Option<&Mapping>,
+    expected: &[String],
+) -> Option<String> {
+    match pattern {
+        Some(pattern) => Some(pattern.as_str().to_string()),
+        None => mapping_expected(mapping, expected),
+    }
+}
+
+fn mapping_expected(mapping: Option<&Mapping>, expected: &[String]) -> Option<String> {
+    mapping.map(|_| {
+        expected
+            .iter()
+            .map(|value| match value.strip_prefix('\u{0}') {
+                Some(unmapped) => format!("<unmapped:{unmapped}>"),
+                None => value.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Orchestration
+// ---------------------------------------------------------------------------
+
+pub fn run(plan: &Plan, config: &EngineConfig) -> Result<Report, String> {
+    let id_idx = config.id_idx;
+    let thread_count = config.threads.max(1);
+
+    let segments = segments_for(&config.path, config.delimiter, thread_count)?;
+
+    // Global row numbers need per-segment offsets, so when there is no id
+    // column we run a cheap parallel counting pass instead of serialising the
+    // whole validation.
+    let need_row_offsets = id_idx.is_none() && segments.len() > 1;
+
+    let slots = Slots::build(plan, id_idx);
+
+    // Resolve file-based mappings up-front, reusing parsed reference tables
+    // and equivalent mappings across rules.
+    let mut cache = mapping::MappingCache::new();
+    let mut mappings: Vec<Vec<Arc<Mapping>>> = Vec::with_capacity(plan.rules.len());
+    for rule in &plan.rules {
+        let mut rule_mappings: Vec<Arc<Mapping>> = Vec::new();
+        if let MappingPlan::Files(sources) = &rule.mapping {
+            // When the rule's `right` is a list of columns, the reference
+            // `mapping_right` columns are a composite value to match; a
+            // single `right` column makes several `mapping_right` columns
+            // alternative acceptable targets instead.
+            let right_composite = matches!(
+                &rule.right,
+                crate::rules::ColumnRef::Columns(values) if values.len() > 1
+            );
+            for source in sources {
+                let mapping = cache.load(
+                    &source.files,
+                    &mapping::FileMappingSpec {
+                        left_columns: &source.left,
+                        right_columns: &source.right,
+                        left_transforms: &rule.transform_left,
+                        right_transforms: &rule.transform_right,
+                        multi: source.multi,
+                        value_separator: &source.separator,
+                        join_separator: &rule.join_separator,
+                        trim: rule.trim,
+                        delimiter: config.delimiter,
+                        right_composite,
+                        filter: source.filter.as_ref(),
+                    },
+                )?;
+                rule_mappings.push(mapping);
+            }
+        }
+        mappings.push(rule_mappings);
+    }
+
+    let auto_indices: Vec<usize> = plan
+        .rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| matches!(rule.mapping, MappingPlan::Auto))
+        .map(|(index, _)| index)
+        .collect();
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .map_err(|e| format!("cannot create thread pool: {e}"))?;
+
+    // Pass 1 (auto mapping) and pass 2 (validation) each read the whole file;
+    // the optional counting pass does too.
+    let progress = config.progress.as_ref();
+    if let Some(progress) = progress {
+        if progress.enabled() {
+            let mut passes: u64 = if auto_indices.is_empty() { 1 } else { 2 };
+            if need_row_offsets {
+                passes += 1;
+            }
+            let file_size = std::fs::metadata(&config.path)
+                .map(|m| m.len())
+                .unwrap_or(0);
+            progress.set_total(file_size * passes);
+        }
+    }
+
+    // First row number (1-based) of each segment, or `None` when row numbers
+    // are not available (parallel run with an id column).
+    let row_bases: Vec<Option<u64>> = if segments.len() <= 1 {
+        vec![Some(1); segments.len()]
+    } else if need_row_offsets {
+        let counts: Vec<u64> = pool.install(|| {
+            segments
+                .par_iter()
+                .map(|&(from, to)| {
+                    count_rows_segment(&config.path, config.delimiter, from, to, progress)
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let mut bases = Vec::with_capacity(counts.len());
+        let mut next = 1u64;
+        for count in counts {
+            bases.push(Some(next));
+            next += count;
+        }
+        bases
+    } else {
+        vec![None; segments.len()]
+    };
+
+    // Pass 1: extract auto mappings from the data.
+    if !auto_indices.is_empty() {
+        let per_segment: Vec<Vec<MapCounts>> = pool.install(|| {
+            segments
+                .par_iter()
+                .map(|&(from, to)| {
+                    build_counts_segment(
+                        &config.path,
+                        config.delimiter,
+                        &plan.rules,
+                        &auto_indices,
+                        &slots,
+                        config.row_filter.as_ref(),
+                        from,
+                        to,
+                        progress,
+                    )
+                })
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+
+        let mut totals: Vec<MapCounts> =
+            (0..auto_indices.len()).map(|_| MapCounts::new()).collect();
+        for segment in per_segment {
+            for (position, counts) in segment.into_iter().enumerate() {
+                mapping::merge_counts(&mut totals[position], counts);
+            }
+        }
+        for (position, &rule_index) in auto_indices.iter().enumerate() {
+            mappings[rule_index] = vec![Arc::new(Mapping::from_counts_auto(std::mem::take(
+                &mut totals[position],
+            )))];
+        }
+    }
+
+    // Pass 2: validate every rule.
+    let per_segment: Vec<Vec<RuleAccum>> = pool.install(|| {
+        segments
+            .par_iter()
+            .zip(row_bases.par_iter())
+            .map(|(&(from, to), &row_base)| {
+                validate_segment(
+                    &config.path,
+                    config.delimiter,
+                    &plan.rules,
+                    &mappings,
+                    &slots,
+                    config.row_filter.as_ref(),
+                    from,
+                    to,
+                    row_base,
+                    config.collect_hits,
+                    config.collect_hits_limit,
+                    config.collect_distinct,
+                    progress,
+                )
+            })
+            .collect::<Result<Vec<_>, String>>()
+    })?;
+
+    let mut accums: Vec<RuleAccum> = plan
+        .rules
+        .iter()
+        .map(|rule| {
+            RuleAccum::new(
+                rule.report_limit,
+                config.collect_hits_limit,
+                config.collect_distinct,
+            )
+        })
+        .collect();
+    for segment in per_segment {
+        for (index, accum) in segment.into_iter().enumerate() {
+            accums[index].merge(accum);
+        }
+    }
+
+    if let Some(progress) = progress {
+        progress.finish();
+    }
+
+    Ok(build_report(plan, accums, mappings))
+}
+
+fn build_report(
+    plan: &Plan,
+    mut accums: Vec<RuleAccum>,
+    mappings: Vec<Vec<Arc<Mapping>>>,
+) -> Report {
+    let mut rules = Vec::with_capacity(plan.rules.len());
+    let mut rows_checked = 0u64;
+
+    for (index, rule) in plan.rules.iter().enumerate() {
+        let hits = std::mem::take(&mut accums[index].hits);
+        let accum = &accums[index];
+        rows_checked = rows_checked.max(accum.checked);
+
+        let mapping_report = mappings[index].first().map(|mapping| {
+            build_mapping_report(mapping, &accum.ambiguous_samples, rule.report_limit)
+        });
+
+        let ambiguous_inputs = mapping_report
+            .as_ref()
+            .map_or(0, |report| report.ambiguous_inputs);
+        let status = if accum.failed == 0 && ambiguous_inputs == 0 {
+            "passed"
+        } else {
+            "failed"
+        };
+
+        rules.push(RuleReport {
+            name: rule.name.clone(),
+            left: rule.left_name.clone(),
+            right: rule.right_name.clone(),
+            status: status.to_string(),
+            rows_checked: accum.checked,
+            rows_passed: accum.passed,
+            rows_failed: accum.failed,
+            rows_skipped: accum.skipped,
+            rows_validation_skipped: accum.validation_skipped,
+            transform_errors: accum.transform_errors,
+            unmapped_values: accum.unmapped,
+            pass_results: accum.pass_results.top(),
+            fail_results: accum.fail_results.top(),
+            validation_skipped_results: accum.skip_results.top(),
+            rule_columns: rule.used_columns(),
+            hits,
+            mapping: mapping_report,
+        });
+    }
+
+    let rules_passed = rules.iter().filter(|r| r.passed()).count();
+
+    Report {
+        left_label: plan.left_label.clone(),
+        right_label: plan.right_label.clone(),
+        rules_total: rules.len(),
+        rules_passed,
+        rules_failed: rules.len() - rules_passed,
+        rows_checked,
+        rules,
+    }
+}
+
+fn build_mapping_report(
+    mapping: &Mapping,
+    ambiguous_samples: &Sampler<Example>,
+    limit: usize,
+) -> MappingReport {
+    let mut entries: Vec<MappingEntry> = mapping
+        .targets
+        .iter()
+        .map(|(input, targets)| MappingEntry {
+            input: input.to_string(),
+            canonical: mapping.expected(input).unwrap_or("").to_string(),
+            ambiguous: mapping.is_ambiguous(input),
+            targets: targets
+                .iter()
+                .map(|(value, count)| TargetExample {
+                    value: value.to_string(),
+                    count: *count,
+                })
+                .collect(),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.input.cmp(&b.input));
+
+    // Collect one example row per ambiguous input.
+    let examples_by_input: HashMap<String, Example> = ambiguous_samples
+        .payloads()
+        .into_iter()
+        .map(|example| (example.left.clone(), example))
+        .collect();
+
+    let mut ambiguous_inputs: Vec<&MappingEntry> =
+        entries.iter().filter(|entry| entry.ambiguous).collect();
+    // Report the worst offenders first (most targets, then most observations).
+    ambiguous_inputs.sort_by(|a, b| {
+        b.targets
+            .len()
+            .cmp(&a.targets.len())
+            .then_with(|| total_count(b).cmp(&total_count(a)))
+            .then_with(|| a.input.cmp(&b.input))
+    });
+
+    let ambiguities: Vec<AmbiguityReport> = ambiguous_inputs
+        .into_iter()
+        .take(limit)
+        .map(|entry| AmbiguityReport {
+            input: entry.input.clone(),
+            targets: entry.targets.iter().take(limit).cloned().collect(),
+            examples: examples_by_input
+                .get(&entry.input)
+                .cloned()
+                .into_iter()
+                .collect(),
+        })
+        .collect();
+
+    MappingReport {
+        source: match mapping.origin {
+            MappingOrigin::Auto => "auto".to_string(),
+            MappingOrigin::File => "file".to_string(),
+        },
+        distinct_inputs: mapping.len(),
+        ambiguous_inputs: mapping.ambiguous_count(),
+        entries,
+        ambiguities,
+    }
+}
+
+fn total_count(entry: &MappingEntry) -> u64 {
+    entry.targets.iter().map(|t| t.count).sum()
+}

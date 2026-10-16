@@ -1,0 +1,50 @@
+# Example rule set for examples/people.csv
+#
+# Run with:
+#   fvalidate examples/people.csv -r examples/rules.vl --id-column id
+
+defaults {
+  separator    = ";"
+  multi        = false
+  compare      = eq
+  report_limit = 10
+}
+
+# 1. Direct, order-independent comparison after normalizing dates coming in
+#    two different formats.
+rule "start and end dates agree" {
+  left            = start_date
+  right           = end_date
+  transform_left  = date(["%Y-%m-%d", "%d/%m/%Y"], "%Y-%m-%d")
+  transform_right = date(["%Y-%m-%d", "%d/%m/%Y"], "%Y-%m-%d")
+  compare         = eq
+}
+
+# 2. Mapping extracted from the data itself: country name -> country code.
+#    "France" also appears with code "US", so the mapping is ambiguous and the
+#    canonical target is the most frequent one.
+rule "country name maps to code" {
+  left           = country_name
+  right          = country_code
+  transform_left = trim | lower
+  mapping        = auto
+}
+
+# 3. Multi-value cells compared as unordered sets (a;b == b;a).
+rule "tags agree as sets" {
+  left      = tags
+  right     = ref_tags
+  multi     = true
+  separator = ";"
+  compare   = eq
+}
+
+# 4. Mapping loaded from several reference files. "Paris" is defined twice with
+#    different codes, which is reported as an ambiguity.
+rule "city maps to code via reference files" {
+  left          = city
+  right         = city_code
+  mapping_files = ["examples/citymap1.csv", "examples/citymap2.csv"]
+  mapping_left  = city
+  mapping_right = code
+}

@@ -1,0 +1,6 @@
+contact_id,full_name,phone_raw,phone_digits,email,email_user,tags,ref_tags
+C1,Alice Smith,+33 6 12 34 56 78,33612345678,alice@example.fr,alice,news;tech,news;tech
+C2,Bob Jones,(06) 12-34-56-78,0612345678,bob.jones@example.com,bob.jones,tech,tech
+C3,Carol,0033 612 345 678,33612345678,carol@example.fr,carol,news;; tech,tech;news
+C4,Dan,12345,99999999,not-an-email,dan,tech,tech
+C5,Eve,+1 555 000 1111,15550001111,eve@example.org,eve,"news, tech",tech;news

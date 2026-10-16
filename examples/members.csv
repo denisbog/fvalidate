@@ -1,0 +1,8 @@
+member_id,country_name,country_code,notes
+M1, France ,FR,active
+M2,USA,US,active
+M3,,,unknown
+M4,Germany,DE,active
+M5, ,  ,blank
+M6,Spain,ES,active
+M7,Italy,IT,active

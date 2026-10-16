@@ -1,0 +1,8 @@
+code,expected,category
+FR,FR,standard
+US,US,standard
+DE,DE,standard
+IT,IT,standard
+ES,ES,standard
+SKIP,WRONG,standard
+LEGACY,OLD,deprecated

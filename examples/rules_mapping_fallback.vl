@@ -1,0 +1,25 @@
+# Ordered mapping sources with different input columns.
+#
+# The first `mapping` block keys on `city`; when a city is absent from
+# examples/citymap1.csv the lookup falls through to the second block, which
+# keys on `city + area` from examples/citymap2-by-area.csv.
+#
+# Run with:
+#   fvalidate examples/cities_fallback.csv -r examples/rules_mapping_fallback.vl --id-column id
+
+rule "city maps to code, falling back to city + area" {
+  right = city_code
+
+  mapping {
+    files = ["examples/citymap1.csv"]
+    left  = city
+    right = code
+  }
+
+  mapping {
+    files = ["examples/citymap2-by-area.csv"]
+    left  = [city, area]
+    right = code
+    when  = unmapped
+  }
+}

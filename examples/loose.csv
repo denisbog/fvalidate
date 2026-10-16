@@ -1,0 +1,9 @@
+id,code_a,code_b,code_c,expected,kind,status
+1,FR,,,FR,primary,active
+2,,US,,US,primary,active
+3,,,DE,DE,primary,active
+4,IT,,,IT,primary,archived
+5,,ES,,XX,primary,active
+6,FR,,,ZZ,secondary,active
+7,SKIP,,,WRONG,primary,active
+8,LEGACY,,,OLD,primary,active

@@ -1,0 +1,34 @@
+# Composite keys: the target value can only be validated with TWO input values.
+#
+# Run with:
+#   fvalidate examples/orders.csv -r examples/rules_composite.vl --id-column order_id
+#
+# The expected warehouse depends on the *pair* (product, region): "widget" alone
+# or "EU" alone is not enough. `left` and `right` therefore accept a list of
+# columns, combined with `join_separator` into a single lookup key.
+
+defaults {
+  join_separator = "|"
+  report_limit   = 10
+}
+
+# 1. The pair (product, region) is looked up in a reference table.
+#    `transform_left` is applied to each component before joining, and also to
+#    the reference file columns, so both sides normalize identically.
+rule "warehouse derived from product and region (reference table)" {
+  left            = [product, region]
+  right           = warehouse
+  transform_left  = trim | lower
+  mapping_files   = ["examples/warehouse_map.csv"]
+  mapping_left    = [product, region]
+  mapping_right   = warehouse
+}
+
+# 2. Same composite key, but the mapping is extracted from the data itself.
+#    The noisy rows make the composite key ambiguous, which is reported.
+rule "warehouse consistent with product and region (auto)" {
+  left           = [product, region]
+  right          = warehouse
+  transform_left = trim | lower
+  mapping        = auto
+}
