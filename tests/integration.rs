@@ -542,6 +542,12 @@ fn fallback_skip_and_mapping_filter() {
     // `validation_skipped = in(status, [...])` skips row 4 (archived).
     assert_eq!(rules[1]["rows_skipped"], 0);
     assert_eq!(rules[1]["rows_validation_skipped"], 1);
+    // The report carries the predicate that defined the skip.
+    assert_eq!(
+        rules[1]["validation_skipped_rule"],
+        "in(status, [\"archived\", \"deleted\"])"
+    );
+    assert!(rules[0].get("validation_skipped_rule").is_none());
     assert_eq!(rules[1]["rows_failed"], 4);
     // The skipped row is grouped alongside the matching/failing examples.
     let skipped = rules[1]["validation_skipped_results"].as_array().unwrap();
@@ -1054,6 +1060,75 @@ fn generated_weather_data_has_matching_and_non_matching_rows() {
     }
     // The city -> country rule resolves every generated city.
     assert_eq!(rules[2]["unmapped_values"].as_u64().unwrap(), 0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Arithmetic can be used directly on either side of a rule.
+#[test]
+fn arithmetic_expressions_on_left_and_right() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-arith-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("arith.csv");
+    let rules = dir.join("arith.vl");
+    std::fs::write(&csv, "id,a,b,c\n1,10,3,7\n2,10,3,8\n3,2.5,1.5,1\n4,x,1,2\n").unwrap();
+    std::fs::write(
+        &rules,
+        "rule \"a minus b equals c\" {\n  left  = a - b\n  right = c\n}\n",
+    )
+    .unwrap();
+
+    let report = run_json(&[
+        csv.to_str().unwrap(),
+        "-r",
+        rules.to_str().unwrap(),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+    let rule = &report["rules"][0];
+    assert_eq!(rule["left"], "a - b");
+    assert_eq!(rule["right"], "c");
+    assert_eq!(rule["rows_checked"], 4);
+    assert_eq!(rule["rows_passed"], 2);
+    assert_eq!(rule["rows_failed"], 2);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `check` validates a single boolean expression, including natural `=`
+/// equality, and ignores a `compare` default meant for two-sided rules.
+#[test]
+fn check_rules_evaluate_a_boolean_expression() {
+    let dir = std::env::temp_dir().join(format!("fvalidate-check-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let csv = dir.join("arith.csv");
+    let rules = dir.join("check.vl");
+    std::fs::write(&csv, "id,a,b,c\n1,10,3,7\n2,10,3,8\n3,2.5,1.5,1\n4,x,1,2\n").unwrap();
+    std::fs::write(
+        &rules,
+        "defaults {\n  compare = ne\n}\nrule \"a minus b equals c\" {\n  check = 'a - b = c'\n}\n",
+    )
+    .unwrap();
+
+    let report = run_json(&[
+        csv.to_str().unwrap(),
+        "-r",
+        rules.to_str().unwrap(),
+        "--id-column",
+        "id",
+        "--format",
+        "json",
+        "--no-fail",
+    ]);
+    let rule = &report["rules"][0];
+    assert_eq!(rule["left"], "a - b = c");
+    assert_eq!(rule["right"], "true");
+    assert_eq!(rule["rows_checked"], 4);
+    assert_eq!(rule["rows_passed"], 2);
+    assert_eq!(rule["rows_failed"], 2);
 
     std::fs::remove_dir_all(&dir).ok();
 }

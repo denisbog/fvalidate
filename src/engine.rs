@@ -1643,6 +1643,7 @@ fn build_report(
             rows_failed: accum.failed,
             rows_skipped: accum.skipped,
             rows_validation_skipped: accum.validation_skipped,
+            validation_skipped_rule: rule.skip_source.clone(),
             transform_errors: accum.transform_errors,
             unmapped_values: accum.unmapped,
             pass_results: accum.pass_results.top(),

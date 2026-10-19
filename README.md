@@ -138,9 +138,10 @@ several lines as long as brackets/quotes balance.
 
 | Key | Meaning |
 | --- | --- |
-| `left`, `right` | Columns to compare: a header name, `#index`, a list `[a, b]` forming a composite key, or a fallback `or(a, b, c)` that picks the first non-empty column. |
+| `left`, `right` | Columns to compare: a header name, `#index`, an expression such as `gross - tax`, a list `[a, b]` forming a composite key, or a fallback `or(a, b, c)` that picks the first non-empty column. |
 | `transform_left`, `transform_right` | Normalization pipeline (see below). With several columns it is applied to **each** component before joining. |
 | `derive` | Xan/moonblade-style expression(s) computing named values from the row, usable in `left` / `right` (see [Derived values](#derived-values-derive)). |
+| `check` | A boolean expression checked against every row (e.g. `'col1 - col2 = col3'`). When present, `left`/`right` are omitted; the rule passes when the expression is truthy. See [Arithmetic checks](#arithmetic-checks). |
 | `compare` | `eq` (default), `ne`, `subset`, `superset`, `intersect`, or regex `matches` / `not_matches`. Operates on token sets. |
 | `multi` | Split cells into multiple values before comparing (default `false`). |
 | `separator` | Token separator when `multi = true`; a plain string or `regex("...")`. |
@@ -238,7 +239,36 @@ and evaluated per row.
 > the string form of their operands, while `==`/`!=`/`<`/… cast both sides to a
 > number. `+` only adds numbers; concatenate strings with `++`. A numerical
 > comparison against a non-numeric value is empty (falsy) rather than an error.
-> See [docs/MIGRATION.md](docs/MIGRATION.md) when porting older expressions.
+> A single `=` is accepted as an alias for `==`, so `col1 - col2 = col3` reads
+> naturally. See [docs/MIGRATION.md](docs/MIGRATION.md) when porting older
+> expressions.
+
+### Arithmetic checks
+
+`left` and `right` accept expressions as well as columns, so a simple identity
+can be written directly:
+
+```text
+rule "net equals gross minus tax" {
+  left  = gross - tax
+  right = net
+}
+```
+
+When the check is naturally a boolean expression, use `check` instead. It is
+evaluated once per row and the row passes when the result is truthy; `left` and
+`right` are not used. `check` may reference columns, values produced by
+`derive`, and the same functions as a derive expression.
+
+```text
+rule "net equals gross minus tax" {
+  check = 'gross - tax = net'
+}
+```
+
+`=` and `==` cast both sides to numbers (natural arithmetic equality), while
+`eq`/`ne` compare strings. Quote an expression when it would otherwise be read
+as a call, e.g. `left = 'int(units) * price'`.
 
 ### Cascading reference values
 
@@ -431,6 +461,9 @@ contains:
 
 * the number of rows checked, passed, **skipped**, **validation skipped** and failed;
 * transform errors and unmapped values;
+* the `validation_skipped` predicate as written, in a **Validation-skipped rule details**
+  section, so the report says *why* rows were skipped (also emitted as
+  `validation_skipped_rule` in JSON);
 * matching, failed and **validation-skipped** rows **aggregated by condition** —
   the `(left, right, expected)` values — with the row count and up to `N`
   example ids per condition, most frequent condition first (`-n` controls `N`,
@@ -614,6 +647,8 @@ docks a vertical rule panel on the left:
   not read from the main grid (and from the row detail form), so a wide file
   collapses to just the attributes that matter; turning it off restores the
   previous attribute set.
+  The detail form also shows the rule's `validation_skipped` predicate, and the
+  rule card repeats it under the outcome counts.
 * Every attribute chip (and each table header) carries a **lock** icon. A locked
   column is pinned visible: **Hide all**, the hide eye, saved profiles and
   "rule attributes only" all leave it in the grid. Click the filled lock to

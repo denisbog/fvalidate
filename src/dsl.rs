@@ -261,6 +261,9 @@ pub struct RuleDef {
     pub transform_right: Vec<Transform>,
     /// Xan/moonblade-style expressions computing named values per row.
     pub derive: Vec<DerivedDef>,
+    /// A boolean expression checked against every row. When present, `left`
+    /// and `right` are not used: the row passes when the expression is truthy.
+    pub check: Option<String>,
     pub compare: Option<CompareOp>,
     pub multi: Option<bool>,
     pub separator: Option<Separator>,
@@ -272,6 +275,9 @@ pub struct RuleDef {
     /// When this predicate holds, the row is counted as skipped instead of
     /// being validated.
     pub skip: Option<Predicate>,
+    /// The `validation_skipped` predicate as written, kept for the report so
+    /// readers can see why a rule skipped a row.
+    pub skip_source: Option<String>,
     /// Selects which rows define a mapping: data rows for `mapping = auto`,
     /// reference rows for `mapping_files`. It never skips validation.
     pub mapping_filter: Option<Predicate>,
@@ -351,6 +357,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     transform_left: Vec::new(),
                     transform_right: Vec::new(),
                     derive: Vec::new(),
+                    check: None,
                     compare: None,
                     multi: None,
                     separator: None,
@@ -359,6 +366,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     trim: None,
                     allow_empty: None,
                     skip: None,
+                    skip_source: None,
                     mapping_filter: None,
                     mapping: MappingSourceDef::None,
                     report_limit: None,
@@ -400,7 +408,8 @@ pub fn parse(text: &str) -> Result<Program, String> {
             .split_once('=')
             .ok_or_else(|| format!("line {line_no}: expected `key = value`"))?;
         let key = key.trim();
-        let value = parse_value(value.trim()).map_err(|e| format!("line {line_no}: {e}"))?;
+        let raw_value = value.trim();
+        let value = parse_value(raw_value).map_err(|e| format!("line {line_no}: {e}"))?;
 
         if let Some(source) = current_mapping.as_mut() {
             apply_mapping_key(source, key, &value, line_no)?;
@@ -411,7 +420,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     let rule = current_rule
                         .as_mut()
                         .ok_or_else(|| format!("line {line_no}: assignment outside a rule"))?;
-                    apply_rule_key(rule, key, &value, line_no)?;
+                    apply_rule_key(rule, key, &value, raw_value, line_no)?;
                 }
                 None => {
                     return Err(format!(
@@ -437,6 +446,39 @@ pub fn parse(text: &str) -> Result<Program, String> {
 
 fn validate_rule(mut rule: RuleDef, line_no: usize) -> Result<RuleDef, String> {
     let _ = line_no;
+
+    // A `check` rule validates a boolean expression instead of comparing two
+    // sides, so the side/mapping keys are not meaningful alongside it.
+    if let Some(check) = &rule.check {
+        if check.trim().is_empty() {
+            return Err(format!("rule '{}': `check` must not be empty", rule.name));
+        }
+        if !rule.left.is_empty() || !rule.right.is_empty() {
+            return Err(format!(
+                "rule '{}': a `check` rule cannot also set `left` or `right`",
+                rule.name
+            ));
+        }
+        if rule.pattern.is_some() {
+            return Err(format!(
+                "rule '{}': a `check` rule cannot also set `pattern`",
+                rule.name
+            ));
+        }
+        if !matches!(rule.mapping, MappingSourceDef::None) {
+            return Err(format!(
+                "rule '{}': a `check` rule cannot also set a mapping",
+                rule.name
+            ));
+        }
+        if !rule.transform_left.is_empty() || !rule.transform_right.is_empty() {
+            return Err(format!(
+                "rule '{}': a `check` rule cannot also set transforms",
+                rule.name
+            ));
+        }
+        return Ok(rule);
+    }
 
     // Finalize each mapping source: fill in the missing side of the
     // reference/data key pair so a block can name only the columns that differ.
@@ -538,6 +580,7 @@ fn apply_rule_key(
     rule: &mut RuleDef,
     key: &str,
     value: &Value,
+    raw_value: &str,
     line_no: usize,
 ) -> Result<(), String> {
     match key {
@@ -550,6 +593,7 @@ fn apply_rule_key(
             rule.derive = expr::parse_derive(source)
                 .map_err(|e| format!("line {line_no}: invalid derive expression: {e}"))?;
         }
+        "check" => rule.check = Some(expect_string_ref(value, key, line_no)?.to_string()),
         "compare" => {
             rule.compare = Some(
                 CompareOp::parse(expect_string_ref(value, key, line_no)?)
@@ -563,7 +607,8 @@ fn apply_rule_key(
         "trim" => rule.trim = Some(expect_bool(value, key, line_no)?),
         "allow_empty" | "optional" => rule.allow_empty = Some(expect_bool(value, key, line_no)?),
         "validation_skipped" | "skip_when" | "skip" => {
-            rule.skip = Some(parse_predicate(value, key, line_no)?)
+            rule.skip = Some(parse_predicate(value, key, line_no)?);
+            rule.skip_source = Some(raw_value.to_string());
         }
         "mapping_filter" => rule.mapping_filter = Some(parse_predicate(value, key, line_no)?),
         "report_limit" => rule.report_limit = Some(expect_usize(value, key, line_no)?),
@@ -772,12 +817,43 @@ fn expect_columns(value: &Value, key: &str, line_no: usize) -> Result<ColumnSpec
             }
             Ok(ColumnSpec::Or(names))
         }
+        // Any other call or pipeline is an expression (e.g. `a - b`,
+        // `int(a) + int(b)` or `name | upper`); keep it as a single value and
+        // let `rules::compile` resolve it into an anonymous derived value.
+        Value::Call(_, _) | Value::Pipeline(_) => {
+            Ok(ColumnSpec::Columns(vec![render_value(value)]))
+        }
         other => other
             .as_str()
             .map(|s| ColumnSpec::Columns(vec![s.to_string()]))
             .ok_or_else(|| {
                 format!("line {line_no}: `{key}` expects a column name, a list or or(...)")
             }),
+    }
+}
+
+/// Render a parsed value back to DSL/expression source. Used when a `left` /
+/// `right` value turns out to be an expression rather than a column name.
+fn render_value(value: &Value) -> String {
+    match value {
+        Value::Str(text) => text.clone(),
+        Value::List(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(render_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Value::Call(name, args) => format!(
+            "{name}({})",
+            args.iter().map(render_value).collect::<Vec<_>>().join(", ")
+        ),
+        Value::Pipeline(steps) => steps
+            .iter()
+            .map(render_value)
+            .collect::<Vec<_>>()
+            .join(" | "),
     }
 }
 

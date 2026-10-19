@@ -506,7 +506,10 @@ fn lex(source: &str) -> Result<Vec<Tok>, String> {
                     toks.push(Tok::EqEq);
                     pos += 2;
                 } else {
-                    return Err("unexpected `=`, use `==` to compare".to_string());
+                    // A single `=` is accepted as an alias for `==`, so a
+                    // natural check such as `col1 - col2 = col3` works.
+                    toks.push(Tok::EqEq);
+                    pos += 1;
                 }
             }
             '!' => {
@@ -1830,6 +1833,12 @@ mod tests {
         assert_eq!(evaluate("1 + 2 * 3", &[]).scalar_string(","), "7");
         assert_eq!(evaluate(r#""a" ++ "b""#, &[]).scalar_string(","), "ab");
         assert_eq!(evaluate("2 ** 3 ** 2", &[]).scalar_string(","), "512");
+    }
+
+    #[test]
+    fn single_equals_is_numeric_equality() {
+        assert_eq!(evaluate("10 - 3 = 7", &[]).scalar_string(","), "true");
+        assert_eq!(evaluate("10 - 3 = 8", &[]).scalar_string(","), "false");
     }
 
     #[test]

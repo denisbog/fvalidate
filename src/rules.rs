@@ -239,6 +239,8 @@ pub struct CompiledRule {
     pub allow_empty: bool,
     /// When this holds, the row is skipped (see `validation_skipped`).
     pub skip: Option<CompiledPredicate>,
+    /// The `validation_skipped` predicate as written, for the report.
+    pub skip_source: Option<String>,
     /// Predicate restricting which data rows an `auto` mapping observes
     /// (compiled against the input headers). `None` for file mappings, whose
     /// filter is resolved against each reference file instead.
@@ -291,25 +293,51 @@ fn resolve_all(
     side: &str,
     columns: &[String],
     headers: &[String],
-    derived: &[String],
+    derived_names: &mut Vec<String>,
+    mut derive_sink: Option<&mut Vec<CompiledDerived>>,
 ) -> Result<Vec<ValueRef>, String> {
-    columns
-        .iter()
-        .map(|column| {
-            // A `derive`d name shadows an input column of the same name.
-            if let Some(index) = derived.iter().position(|name| name == column) {
-                return Ok(ValueRef::Derived(index));
+    let mut references = Vec::with_capacity(columns.len());
+
+    for column in columns {
+        // A `derive`d name shadows an input column of the same name.
+        if let Some(index) = derived_names.iter().position(|name| name == column) {
+            references.push(ValueRef::Derived(index));
+            continue;
+        }
+
+        if let Some(index) = ColumnResolver::resolve(column, headers) {
+            references.push(ValueRef::Column(index));
+            continue;
+        }
+
+        // Not a column: allow a bare expression such as `col1 - col2` on
+        // either side. It is compiled into an anonymous derived value so the
+        // rest of the engine keeps operating on the usual side references.
+        if let Some(sink) = derive_sink.as_deref_mut() {
+            if let Ok(mut expression) = crate::expr::parse_filter(column) {
+                if resolve_expr(context, &mut expression, headers, derived_names).is_ok() {
+                    // The synthetic name is only used for index bookkeeping;
+                    // `\u{0}` cannot appear in a real column name.
+                    let index = derived_names.len();
+                    let name = format!("\u{0}{index}");
+                    derived_names.push(name.clone());
+                    sink.push(CompiledDerived {
+                        names: vec![name],
+                        expr: expression,
+                    });
+                    references.push(ValueRef::Derived(index));
+                    continue;
+                }
             }
-            ColumnResolver::resolve(column, headers)
-                .map(ValueRef::Column)
-                .ok_or_else(|| {
-                    format!(
-                        "{context}: {side} column '{column}' not found (available: {})",
-                        headers.join(", ")
-                    )
-                })
-        })
-        .collect()
+        }
+
+        return Err(format!(
+            "{context}: {side} column '{column}' not found (available: {})",
+            headers.join(", ")
+        ));
+    }
+
+    Ok(references)
 }
 
 fn compile_columns(
@@ -317,9 +345,17 @@ fn compile_columns(
     side: &str,
     spec: &ColumnSpec,
     headers: &[String],
-    derived: &[String],
+    derived_names: &mut Vec<String>,
+    derive_sink: Option<&mut Vec<CompiledDerived>>,
 ) -> Result<ColumnRef, String> {
-    let references = resolve_all(context, side, spec.names(), headers, derived)?;
+    let references = resolve_all(
+        context,
+        side,
+        spec.names(),
+        headers,
+        derived_names,
+        derive_sink,
+    )?;
     Ok(match spec {
         ColumnSpec::Columns(_) => ColumnRef::Columns(references),
         ColumnSpec::Or(_) => ColumnRef::Or(references),
@@ -340,7 +376,8 @@ fn compile_condition_column(
             ));
         }
     }
-    compile_columns(context, "condition", spec, headers, &[])
+    let mut derived = Vec::new();
+    compile_columns(context, "condition", spec, headers, &mut derived, None)
 }
 
 /// Compile a DSL predicate against a set of headers. `context` labels any
@@ -615,8 +652,62 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             });
         }
 
-        let left = compile_columns(&context, "left", &def.left, headers, &derived_names)?;
-        let right = compile_columns(&context, "right", &def.right, headers, &derived_names)?;
+        // A `check` rule is a single boolean expression. It is compiled into
+        // two anonymous derived values (the result and the literal `true`), so
+        // the normal comparison pipeline reports pass/fail without a separate
+        // execution path.
+        let check_source = def.check.clone();
+        let check = match check_source.as_deref() {
+            Some(source) => {
+                let mut expr = crate::expr::parse_filter(source).map_err(|e| {
+                    format!("{context}: invalid `check` expression: {e}")
+                })?;
+                resolve_expr(&context, &mut expr, headers, &derived_names)?;
+                Some(expr)
+            }
+            None => None,
+        };
+
+        let (left, right) = if let Some(expr) = check {
+            let result_index = derived_names.len();
+            let result_name = format!("\u{0}{result_index}");
+            derived_names.push(result_name.clone());
+            derive.push(CompiledDerived {
+                names: vec![result_name],
+                expr,
+            });
+
+            let expected_index = derived_names.len();
+            let expected_name = format!("\u{0}{expected_index}");
+            derived_names.push(expected_name.clone());
+            derive.push(CompiledDerived {
+                names: vec![expected_name],
+                expr: Expr::Str("true".to_string()),
+            });
+
+            (
+                ColumnRef::Columns(vec![ValueRef::Derived(result_index)]),
+                ColumnRef::Columns(vec![ValueRef::Derived(expected_index)]),
+            )
+        } else {
+            let left = compile_columns(
+                &context,
+                "left",
+                &def.left,
+                headers,
+                &mut derived_names,
+                Some(&mut derive),
+            )?;
+            let right = compile_columns(
+                &context,
+                "right",
+                &def.right,
+                headers,
+                &mut derived_names,
+                Some(&mut derive),
+            )?;
+            (left, right)
+        };
         let skip = def
             .skip
             .as_ref()
@@ -636,11 +727,16 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
         let trim = def.trim.unwrap_or(program.defaults.trim);
         let allow_empty = def.allow_empty.unwrap_or(program.defaults.allow_empty);
 
-        // `pattern` implies a regex comparison unless stated otherwise.
-        let compare = match def.compare {
-            Some(compare) => compare,
-            None if def.pattern.is_some() => CompareOp::Matches,
-            None => program.defaults.compare,
+        // `pattern` implies a regex comparison unless stated otherwise. A
+        // check rule always compares its boolean result with `true`.
+        let compare = if check_source.is_some() {
+            CompareOp::Eq
+        } else {
+            match def.compare {
+                Some(compare) => compare,
+                None if def.pattern.is_some() => CompareOp::Matches,
+                None => program.defaults.compare,
+            }
         };
         if compare.is_regex() && def.pattern.is_none() {
             return Err(format!(
@@ -664,8 +760,14 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
                     .iter()
                     .map(|source| {
                         let key_spec = source.key.clone().unwrap_or_else(|| def.left.clone());
-                        let key =
-                            compile_columns(&context, "mapping key", &key_spec, headers, &derived_names)?;
+                        let key = compile_columns(
+                            &context,
+                            "mapping key",
+                            &key_spec,
+                            headers,
+                            &mut derived_names,
+                            Some(&mut derive),
+                        )?;
                         Ok(MappingSourcePlan {
                             files: source.files.clone(),
                             left: source.left.clone(),
@@ -706,7 +808,9 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             MappingSourceDef::Files(_) => None,
         };
 
-        let left_name = if !def.left.is_empty() {
+        let left_name = if let Some(source) = &check_source {
+            source.clone()
+        } else if !def.left.is_empty() {
             def.left.display()
         } else if let MappingSourceDef::Files(sources) = &def.mapping {
             sources
@@ -716,7 +820,9 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
         } else {
             def.left.display()
         };
-        let right_name = if def.right.is_empty() {
+        let right_name = if check_source.is_some() {
+            "true".to_string()
+        } else if def.right.is_empty() {
             "(pattern)".to_string()
         } else {
             def.right.display()
@@ -739,6 +845,7 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             trim,
             allow_empty,
             skip,
+            skip_source: def.skip_source,
             auto_mapping_filter,
             mapping,
             report_limit,

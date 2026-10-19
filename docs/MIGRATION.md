@@ -31,6 +31,7 @@ so does this crate now.
 | --- | --- | --- |
 | `==`, `!=`, `<`, `<=`, `>`, `>=` | **numerical** (both sides are cast to a number) | `count >= 10`, `"2" < "10"` → `false` |
 | `eq`, `ne`, `lt`, `le`, `gt`, `ge` | **string**/sequence comparison | `name eq "alice"`, `"2" lt "10"` → `true` |
+| `=` | alias for `==` (numerical) | `col1 - col2 = col3` |
 
 Port a string comparison by swapping the symbol for its word form:
 
