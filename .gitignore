@@ -2,3 +2,8 @@
 examples/big.csv
 /test.html
 /report.html
+/report.htlm
+/test-label.html
+/test-label-applied.html
+examples/weather*.csv
+examples/*.pdf
