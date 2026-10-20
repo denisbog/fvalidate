@@ -128,9 +128,6 @@ pub struct RuleReport {
     pub rows_skipped: u64,
     /// Rows skipped by an explicit \`validation_skipped\` predicate.
     pub rows_validation_skipped: u64,
-    /// The `validation_skipped` predicate as written, when the rule uses one.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub validation_skipped_rule: Option<String>,
     pub transform_errors: u64,
     pub unmapped_values: u64,
     /// Matching rows aggregated by value, most frequent first (up to the
@@ -211,9 +208,6 @@ impl Report {
             );
             let _ = writeln!(out, "    {left_label:<side_width$} : {}", rule.left);
             let _ = writeln!(out, "    {right_label:<side_width$} : {}", rule.right);
-            if let Some(skip_rule) = &rule.validation_skipped_rule {
-                let _ = writeln!(out, "    validation skipped rule details : {skip_rule}");
-            }
             let _ = writeln!(
                 out,
                 "    checked={} passed={} failed={} skipped={} validation_skipped={} transform_errors={} unmapped_values={}",
@@ -455,14 +449,6 @@ impl Report {
                 html_escape(&rule.left),
                 html_escape(&rule.right),
             );
-            if let Some(skip_rule) = &rule.validation_skipped_rule {
-                let _ = writeln!(
-                    out,
-                    "<section class=\"skip-rule\"><h3 class=\"skip\">Validation-skipped rule details</h3>\
-                     <p><code>{}</code></p></section>",
-                    html_escape(skip_rule),
-                );
-            }
             let _ = writeln!(
                 out,
                 "<div class=\"stats\"><span>checked <b>{}</b></span>\

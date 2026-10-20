@@ -239,8 +239,6 @@ pub struct CompiledRule {
     pub allow_empty: bool,
     /// When this holds, the row is skipped (see `validation_skipped`).
     pub skip: Option<CompiledPredicate>,
-    /// The `validation_skipped` predicate as written, for the report.
-    pub skip_source: Option<String>,
     /// Predicate restricting which data rows an `auto` mapping observes
     /// (compiled against the input headers). `None` for file mappings, whose
     /// filter is resolved against each reference file instead.
@@ -845,7 +843,6 @@ pub fn compile(program: Program, headers: &[String]) -> Result<Plan, String> {
             trim,
             allow_empty,
             skip,
-            skip_source: def.skip_source,
             auto_mapping_filter,
             mapping,
             report_limit,

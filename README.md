@@ -461,9 +461,6 @@ contains:
 
 * the number of rows checked, passed, **skipped**, **validation skipped** and failed;
 * transform errors and unmapped values;
-* the `validation_skipped` predicate as written, in a **Validation-skipped rule details**
-  section, so the report says *why* rows were skipped (also emitted as
-  `validation_skipped_rule` in JSON);
 * matching, failed and **validation-skipped** rows **aggregated by condition** —
   the `(left, right, expected)` values — with the row count and up to `N`
   example ids per condition, most frequent condition first (`-n` controls `N`,

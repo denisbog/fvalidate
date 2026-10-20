@@ -275,9 +275,6 @@ pub struct RuleDef {
     /// When this predicate holds, the row is counted as skipped instead of
     /// being validated.
     pub skip: Option<Predicate>,
-    /// The `validation_skipped` predicate as written, kept for the report so
-    /// readers can see why a rule skipped a row.
-    pub skip_source: Option<String>,
     /// Selects which rows define a mapping: data rows for `mapping = auto`,
     /// reference rows for `mapping_files`. It never skips validation.
     pub mapping_filter: Option<Predicate>,
@@ -366,7 +363,6 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     trim: None,
                     allow_empty: None,
                     skip: None,
-                    skip_source: None,
                     mapping_filter: None,
                     mapping: MappingSourceDef::None,
                     report_limit: None,
@@ -420,7 +416,7 @@ pub fn parse(text: &str) -> Result<Program, String> {
                     let rule = current_rule
                         .as_mut()
                         .ok_or_else(|| format!("line {line_no}: assignment outside a rule"))?;
-                    apply_rule_key(rule, key, &value, raw_value, line_no)?;
+                    apply_rule_key(rule, key, &value, line_no)?;
                 }
                 None => {
                     return Err(format!(
@@ -580,7 +576,6 @@ fn apply_rule_key(
     rule: &mut RuleDef,
     key: &str,
     value: &Value,
-    raw_value: &str,
     line_no: usize,
 ) -> Result<(), String> {
     match key {
@@ -608,7 +603,6 @@ fn apply_rule_key(
         "allow_empty" | "optional" => rule.allow_empty = Some(expect_bool(value, key, line_no)?),
         "validation_skipped" | "skip_when" | "skip" => {
             rule.skip = Some(parse_predicate(value, key, line_no)?);
-            rule.skip_source = Some(raw_value.to_string());
         }
         "mapping_filter" => rule.mapping_filter = Some(parse_predicate(value, key, line_no)?),
         "report_limit" => rule.report_limit = Some(expect_usize(value, key, line_no)?),

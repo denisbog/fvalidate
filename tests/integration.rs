@@ -542,12 +542,6 @@ fn fallback_skip_and_mapping_filter() {
     // `validation_skipped = in(status, [...])` skips row 4 (archived).
     assert_eq!(rules[1]["rows_skipped"], 0);
     assert_eq!(rules[1]["rows_validation_skipped"], 1);
-    // The report carries the predicate that defined the skip.
-    assert_eq!(
-        rules[1]["validation_skipped_rule"],
-        "in(status, [\"archived\", \"deleted\"])"
-    );
-    assert!(rules[0].get("validation_skipped_rule").is_none());
     assert_eq!(rules[1]["rows_failed"], 4);
     // The skipped row is grouped alongside the matching/failing examples.
     let skipped = rules[1]["validation_skipped_results"].as_array().unwrap();

@@ -3178,17 +3178,12 @@ impl Viewer {
                 if !needle.is_empty() {
                     fields.retain(|(name, _)| name.to_lowercase().contains(&needle));
                 }
-                let skip_rule = detail
-                    .rule
-                    .and_then(|index| self.rules.report.as_ref()?.rules.get(index))
-                    .and_then(|rule| rule.validation_skipped_rule.as_deref());
                 stack([
                     content,
                     detail_form(
                         &detail.title,
                         &fields,
                         listed,
-                        skip_rule,
                         &self.detail_filter,
                         self.detail_show_all,
                         self.copy_notice.as_deref(),
@@ -3451,17 +3446,6 @@ impl Viewer {
 
         let mut card = column![title_row, stats].spacing(6).padding(8);
 
-        // The `validation_skipped` predicate is part of the rule's report, so
-        // show it in the card too (the outcome count above already links to
-        // the skipped rows).
-        if let Some(skip_rule) = &rule.validation_skipped_rule {
-            card = card.push(
-                text(format!("validation skipped when {skip_rule}"))
-                    .size(11)
-                    .color(muted_text(theme))
-                    .wrapping(Wrapping::Word),
-            );
-        }
 
         if active {
             let label = match filter {
@@ -3868,7 +3852,6 @@ fn detail_form<'a>(
     title: &'a str,
     fields: &[(String, String)],
     listed: usize,
-    skip_rule: Option<&'a str>,
     filter: &'a str,
     show_all: bool,
     copy_notice: Option<&str>,
@@ -3924,20 +3907,6 @@ fn detail_form<'a>(
         );
     }
 
-    // The rule that skipped this row is shown next to its attributes, so the
-    // reason is visible without going back to the rules panel.
-    if let Some(skip_rule) = skip_rule {
-        form = form.push(horizontal_rule(1).style(divider_style));
-        form = form.push(
-            column![
-                text("Validation-skipped rule details")
-                    .size(12)
-                    .color(muted_text(theme)),
-                text(skip_rule).size(13).wrapping(Wrapping::Word),
-            ]
-            .spacing(4),
-        );
-    }
 
     // Header: a tinted glyph, the match number and a short attribute count.
     let heading = row![
